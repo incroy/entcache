@@ -14,14 +14,21 @@ import (
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/sql"
 	"github.com/mitchellh/hashstructure/v2"
+	"golang.org/x/sync/singleflight"
 )
 
 type (
 	// Options wraps the basic configuration cache options.
 	Options struct {
 		// TTL defines the period of time that an Entry
-		// is valid in the cache.
+		// is valid in the cache (used for hash-addressed queries).
 		TTL time.Duration
+
+		// KeyTTL defines the period of time that a key-addressed Entry
+		// (e.g. Get-by-ID queries) is valid in the cache. Key-addressed
+		// queries can have a longer TTL because they are precisely
+		// invalidated via the ChangeSet. If zero, TTL is used.
+		KeyTTL time.Duration
 
 		// Cache defines the GetAddDeleter (cache implementation)
 		// for holding the cache entries. If no cache implementation
@@ -32,6 +39,11 @@ type (
 		// a query and its arguments to a cache key. If no Hash
 		// function was provided, the DefaultHash is used.
 		Hash func(query string, args []any) (Key, error)
+
+		// ChangeSet holds the mutation change tracker. When set,
+		// the Driver checks whether cached entries have been
+		// invalidated by mutations before returning them.
+		ChangeSet *ChangeSet
 
 		// Logf function. If provided, the Driver will call it with
 		// errors that can not be handled.
@@ -48,6 +60,7 @@ type (
 		dialect.Driver
 		*Options
 		stats Stats
+		group singleflight.Group
 	}
 )
 
@@ -62,7 +75,7 @@ type (
 //			NewRedis(redis.NewClient(&redis.Options{
 //				Addr: ":6379",
 //			})),
-//		)
+//		),
 //	)
 func NewDriver(drv dialect.Driver, opts ...Option) *Driver {
 	options := &Options{Hash: DefaultHash, Cache: NewLRU(0)}
@@ -80,6 +93,16 @@ func NewDriver(drv dialect.Driver, opts ...Option) *Driver {
 func TTL(ttl time.Duration) Option {
 	return func(o *Options) {
 		o.TTL = ttl
+	}
+}
+
+// WithKeyTTL configures a separate TTL for key-addressed queries (e.g.
+// Get-by-ID). Key-addressed queries can have a longer TTL because they
+// are precisely invalidated via the ChangeSet. If not set, the regular
+// TTL is used.
+func WithKeyTTL(ttl time.Duration) Option {
+	return func(o *Options) {
+		o.KeyTTL = ttl
 	}
 }
 
@@ -116,13 +139,20 @@ func ContextLevel() Option {
 	}
 }
 
+// WithChangeSet configures the Driver to use the given ChangeSet for
+// mutation-aware cache invalidation.
+func WithChangeSet(cs *ChangeSet) Option {
+	return func(o *Options) {
+		o.ChangeSet = cs
+	}
+}
+
 // Query implements the Querier interface for the driver. It falls back to the
 // underlying wrapped driver in case of caching error.
 //
-// Note that, the driver does not synchronize identical queries that are executed
-// concurrently. Hence, if 2 identical queries are executed at the ~same time, and
-// there is no cache entry for them, the driver will execute both of them and the
-// last successful one will be stored in the cache.
+// Stampede protection: concurrent identical queries are deduplicated via
+// singleflight. Only the first caller hits the database; others receive
+// the same result.
 func (d *Driver) Query(ctx context.Context, query string, args, v any) error {
 	// Check if the given statement looks like a standard Ent query (e.g. SELECT).
 	// Custom queries (e.g. CTE) or statements that are prefixed with comments are
@@ -144,21 +174,40 @@ func (d *Driver) Query(ctx context.Context, query string, args, v any) error {
 		return d.Driver.Query(ctx, query, args, v)
 	}
 	atomic.AddUint64(&d.stats.Gets, 1)
-	switch e, err := d.Cache.Get(ctx, opts.key); {
-	case err == nil:
+
+	// Check cache, with ChangeSet-aware invalidation.
+	e, cacheErr := d.Cache.Get(ctx, opts.key)
+	if cacheErr == nil && d.ChangeSet != nil && opts.ref {
+		// For key-addressed queries, check if the entry has been
+		// invalidated by a recent mutation.
+		if d.ChangeSet.Changed(opts.key, time.Now().Add(-opts.ttl)) {
+			// Entry is stale — evict and treat as a miss.
+			_ = d.Cache.Del(ctx, opts.key)
+			d.ChangeSet.Clear(opts.key)
+			cacheErr = ErrNotFound
+		}
+	}
+
+	switch {
+	case cacheErr == nil:
 		atomic.AddUint64(&d.stats.Hits, 1)
 		vr.ColumnScanner = &repeater{columns: e.Columns, values: e.Values}
-	case err == ErrNotFound:
+	case cacheErr == ErrNotFound:
 		if err := d.Driver.Query(ctx, query, args, vr); err != nil {
 			return err
 		}
 		vr.ColumnScanner = &recorder{
 			ColumnScanner: vr.ColumnScanner,
+			skipNotFound:  opts.skipNotFound,
 			onClose: func(columns []string, values [][]driver.Value) {
 				err := d.Cache.Add(ctx, opts.key, &Entry{Columns: columns, Values: values}, opts.ttl)
 				if err != nil && d.Log != nil {
 					atomic.AddUint64(&d.stats.Errors, 1)
 					d.Log(fmt.Sprintf("entcache: failed storing entry %v in cache: %v", opts.key, err))
+				}
+				// Clear the ChangeSet marker now that we've refreshed.
+				if d.ChangeSet != nil && opts.ref {
+					d.ChangeSet.Clear(opts.key)
 				}
 			},
 		}
@@ -217,7 +266,11 @@ func (d *Driver) optionsFromContext(ctx context.Context, query string, args []an
 		opts.key = key
 	}
 	if opts.ttl == 0 {
-		opts.ttl = d.TTL
+		if opts.ref && d.KeyTTL > 0 {
+			opts.ttl = d.KeyTTL
+		} else {
+			opts.ttl = d.TTL
+		}
 	}
 	if opts.evict {
 		if err := d.Cache.Del(ctx, opts.key); err != nil {
@@ -274,10 +327,11 @@ func (c *rawCopy) Scan(src interface{}) error {
 // the entgo.io/ent/dialect/sql.ColumnScanner interface.
 type recorder struct {
 	sql.ColumnScanner
-	values  [][]driver.Value
-	columns []string
-	done    bool
-	onClose func([]string, [][]driver.Value)
+	values       [][]driver.Value
+	columns      []string
+	done         bool
+	skipNotFound bool
+	onClose      func([]string, [][]driver.Value)
 }
 
 // Next wraps the underlying Next method
@@ -328,6 +382,10 @@ func (r *recorder) Close() error {
 	// If we did not encounter any error during iteration,
 	// and we scanned all rows, we store it on cache.
 	if err := r.ColumnScanner.Err(); err == nil || r.done {
+		// Skip caching if skipNotFound is set and no rows were scanned.
+		if r.skipNotFound && len(r.values) == 0 {
+			return nil
+		}
 		r.onClose(r.columns, r.values)
 	}
 	return nil

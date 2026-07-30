@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"ariga.io/entcache"
+	"github.com/incroy/entcache"
 
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/sql"

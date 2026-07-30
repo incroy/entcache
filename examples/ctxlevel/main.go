@@ -9,7 +9,7 @@ import (
 	"todo/ent"
 	"todo/ent/migrate"
 
-	"ariga.io/entcache"
+	"github.com/incroy/entcache"
 	"entgo.io/contrib/entgql"
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/sql"

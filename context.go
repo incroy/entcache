@@ -2,6 +2,7 @@ package entcache
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -29,10 +30,12 @@ func FromContext(ctx context.Context) (AddGetDeleter, bool) {
 
 // ctxOptions allows injecting runtime options.
 type ctxOptions struct {
-	skip  bool          // i.e. skip entry.
-	evict bool          // i.e. skip and invalidate entry.
-	key   Key           // entry key.
-	ttl   time.Duration // entry duration.
+	skip         bool          // i.e. skip entry.
+	evict        bool          // i.e. skip and invalidate entry.
+	key          Key           // entry key.
+	ttl          time.Duration // entry duration.
+	ref          bool          // indicates this is a key-addressed query (e.g. Get by ID).
+	skipNotFound bool          // skip cache if query returns 0 rows.
 }
 
 var ctxOptionsKey ctxOptions
@@ -41,7 +44,6 @@ var ctxOptionsKey ctxOptions
 // to skip the cache entry on Query.
 //
 //	client.T.Query().All(entcache.Skip(ctx))
-//
 func Skip(ctx context.Context) context.Context {
 	c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions)
 	if !ok {
@@ -55,7 +57,6 @@ func Skip(ctx context.Context) context.Context {
 // to skip and invalidate the cache entry on Query.
 //
 //	client.T.Query().All(entcache.Evict(ctx))
-//
 func Evict(ctx context.Context) context.Context {
 	c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions)
 	if !ok {
@@ -71,7 +72,6 @@ func Evict(ctx context.Context) context.Context {
 // more than 1 SQL query (e.g. eager loading).
 //
 //	client.T.Query().All(entcache.WithKey(ctx, "key"))
-//
 func WithKey(ctx context.Context, key Key) context.Context {
 	c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions)
 	if !ok {
@@ -84,12 +84,41 @@ func WithKey(ctx context.Context, key Key) context.Context {
 // WithTTL returns a new Context that carries the TTL for the cache entry.
 //
 //	client.T.Query().All(entcache.WithTTL(ctx, time.Second))
-//
 func WithTTL(ctx context.Context, ttl time.Duration) context.Context {
 	c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions)
 	if !ok {
 		return context.WithValue(ctx, ctxOptionsKey, &ctxOptions{ttl: ttl})
 	}
 	c.ttl = ttl
+	return ctx
+}
+
+// WithEntryKey returns a new Context with a structured entity key (e.g.
+// "User:42") and marks the query as key-addressed. Key-addressed queries
+// are eligible for the longer KeyTTL and precise invalidation via ChangeSet.
+//
+//	client.User.Get(entcache.WithEntryKey(ctx, "User", 42), 42)
+func WithEntryKey(ctx context.Context, typ string, id any) context.Context {
+	key := fmt.Sprintf("%s:%v", typ, id)
+	c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions)
+	if !ok {
+		return context.WithValue(ctx, ctxOptionsKey, &ctxOptions{key: Key(key), ref: true})
+	}
+	c.key = Key(key)
+	c.ref = true
+	return ctx
+}
+
+// SkipNotFound returns a new Context that tells the Driver to skip caching
+// when the query result contains zero rows. This prevents caching empty
+// results for entities that may be created shortly after.
+//
+//	client.User.Get(entcache.SkipNotFound(ctx), 42)
+func SkipNotFound(ctx context.Context) context.Context {
+	c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions)
+	if !ok {
+		return context.WithValue(ctx, ctxOptionsKey, &ctxOptions{skipNotFound: true})
+	}
+	c.skipNotFound = true
 	return ctx
 }

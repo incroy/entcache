@@ -1,14 +1,14 @@
-module ctxlevel
+module multilevel
 
 go 1.17
 
 replace (
-	ariga.io/entcache => ../../../
+	github.com/incroy/entcache => ../../../
 	todo => ../todo
 )
 
 require (
-	ariga.io/entcache v0.0.0
+	github.com/incroy/entcache v0.0.0
 	todo v0.0.0
 )
 
