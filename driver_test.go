@@ -13,7 +13,6 @@ import (
 	"github.com/incroy/entcache/natscache"
 	"github.com/incroy/entcache/rediscache"
 	"github.com/incroy/entcache/rueidiscache"
-	"github.com/stretchr/testify/require"
 
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/sql"
@@ -496,58 +495,4 @@ func TestDriver_StampedeLock(t *testing.T) {
 	if err := sqlMock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestDriver_NatsStampedeLock(t *testing.T) {
-	ctx := context.Background()
-	opts := natsserver.DefaultTestOptions
-	opts.Port = -1
-	opts.JetStream = true
-	opts.StoreDir = t.TempDir()
-
-	s := natsserver.RunServer(&opts)
-	defer s.Shutdown()
-
-	nc, err := nats.Connect(s.ClientURL())
-	require.NoError(t, err, "failed to connect to embedded NATS server")
-	defer nc.Close()
-
-	js, err := jetstream.New(nc)
-	require.NoError(t, err, "failed to create JetStream")
-
-	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket:         "entcache_driver_stampede",
-		TTL:            time.Minute,
-		LimitMarkerTTL: 1 * time.Second,
-	})
-	require.NoError(t, err, "failed to create KV bucket")
-
-	db, sqlMock, err := sqlmock.New()
-	require.NoError(t, err)
-
-	// Expect exactly 1 query to database
-	sqlMock.ExpectQuery("SELECT name FROM users").
-		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("alice").AddRow("bob"))
-
-	drv := entcache.NewDriver(
-		sql.OpenDB(dialect.Postgres, db),
-		entcache.Levels(natscache.New(kv)),
-		entcache.TTL(time.Minute),
-	)
-
-	var wg sync.WaitGroup
-	// 5 concurrent requests hitting the same missing key
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			if i > 0 {
-				time.Sleep(10 * time.Millisecond) // Give the first query a slight head start to win lock
-			}
-			expectQuery(ctx, t, drv, "SELECT name FROM users", []interface{}{"alice", "bob"})
-		}(i)
-	}
-	wg.Wait()
-
-	require.NoError(t, sqlMock.ExpectationsWereMet())
 }

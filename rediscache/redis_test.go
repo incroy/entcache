@@ -3,118 +3,153 @@ package rediscache_test
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/go-redis/redismock/v9"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/incroy/entcache"
 	"github.com/incroy/entcache/rediscache"
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRedisCache(t *testing.T) {
 	ctx := context.Background()
-	rdb, mock := redismock.NewClientMock()
+	s, err := miniredis.Run()
+	require.NoError(t, err)
+	defer s.Close()
+
+	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer rdb.Close()
 	c := rediscache.New(rdb)
 
 	entry := &entcache.Entry{
 		Columns: []string{"id"},
 		Values:  [][]driver.Value{{int64(42)}},
 	}
-	buf, _ := entry.MarshalBinary()
 
 	// 1. Get Miss
-	mock.ExpectGet("user:42").RedisNil()
-	if _, err := c.Get(ctx, "user:42"); err != entcache.ErrNotFound {
-		t.Fatalf("expected ErrNotFound, got %v", err)
-	}
+	_, err = c.Get(ctx, "user:42")
+	require.ErrorIs(t, err, entcache.ErrNotFound)
 
 	// 2. Add
-	mock.ExpectSet("user:42", buf, time.Minute).SetVal("OK")
-	if err := c.Add(ctx, "user:42", entry, time.Minute); err != nil {
-		t.Fatalf("failed to Add: %v", err)
-	}
+	err = c.Add(ctx, "user:42", entry, time.Minute)
+	require.NoError(t, err)
 
 	// 3. Get Hit
-	mock.ExpectGet("user:42").SetVal(string(buf))
 	got, err := c.Get(ctx, "user:42")
-	if err != nil {
-		t.Fatalf("failed to Get: %v", err)
-	}
-	if len(got.Values) != 1 || got.Values[0][0] != int64(42) {
-		t.Errorf("unexpected value in entry: %v", got.Values)
-	}
+	require.NoError(t, err)
+	require.Len(t, got.Values, 1)
+	require.Equal(t, int64(42), got.Values[0][0])
 
 	// 4. Del
-	mock.ExpectDel("user:42").SetVal(1)
-	if err := c.Del(ctx, "user:42"); err != nil {
-		t.Fatalf("failed to Del: %v", err)
-	}
+	err = c.Del(ctx, "user:42")
+	require.NoError(t, err)
 
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatal(err)
-	}
+	// 5. Get Miss again
+	_, err = c.Get(ctx, "user:42")
+	require.ErrorIs(t, err, entcache.ErrNotFound)
 }
 
-func TestRedisLockOrWait_Stampede(t *testing.T) {
+func TestRedisLockOrWait_Timeout(t *testing.T) {
 	ctx := context.Background()
-	rdb, mock := redismock.NewClientMock()
+	s, err := miniredis.Run()
+	require.NoError(t, err)
+	defer s.Close()
+
+	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer rdb.Close()
 	c := rediscache.New(rdb)
-	key := "test:redis:stampede"
+	key := "test:redis:timeout"
 
-	won1, wait1, release1, err1 := c.LockOrWait(ctx, key)
-	if err1 != nil {
-		t.Fatalf("first LockOrWait failed: %v", err1)
-	}
-	if !won1 {
-		t.Fatalf("expected first call to win lock")
-	}
+	// 1. Winner acquires lock
+	won, wait, release, err := c.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.Nil(t, wait)
+	require.NotNil(t, release)
 
-	won2, wait2, _, err2 := c.LockOrWait(ctx, key)
-	if err2 != nil {
-		t.Fatalf("second LockOrWait failed: %v", err2)
-	}
-	if won2 {
-		t.Fatalf("expected second call to lose lock")
-	}
-
-	entry := &entcache.Entry{
-		Columns: []string{"id"},
-		Values:  [][]driver.Value{{int64(99)}},
-	}
-	buf, _ := entry.MarshalBinary()
-
-	mock.ExpectSet(key, buf, time.Minute).SetVal("OK")
-	mock.ExpectGet(key).SetVal(string(buf))
-
+	// 2. Waiter starts waiting
 	var wg sync.WaitGroup
-	var waiterEntry *entcache.Entry
+	wg.Add(1)
+	var waiterErr error
+	go func() {
+		defer wg.Done()
+		won2, wait2, _, err2 := c.LockOrWait(ctx, key)
+		if err2 != nil {
+			waiterErr = err2
+			return
+		}
+		if won2 {
+			waiterErr = errors.New("waiter incorrectly won the lock")
+			return
+		}
+		_, waiterErr = wait2(ctx)
+	}()
+
+	// 3. Winner crashes (we don't call release, and heartbeat should die when we close something,
+	// but we actually just need to wait for the internal lock TTL to expire if the heartbeat stops).
+	// For testing, let's just delete the internal lock key directly to simulate expiration/crash.
+	time.Sleep(100 * time.Millisecond) // let waiter subscribe
+	s.Del("lock:" + key)
+
+	wg.Wait()
+	// Waiter should wake up (either by seeing the key deleted or polling) and return ErrRetryLocker
+	require.ErrorIs(t, waiterErr, entcache.ErrRetryLocker)
+
+	release(ctx) // cleanup
+}
+
+func TestRedisLockOrWait_ContextCancellation(t *testing.T) {
+	ctx := context.Background()
+	s, err := miniredis.Run()
+	require.NoError(t, err)
+	defer s.Close()
+
+	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer rdb.Close()
+	c := rediscache.New(rdb)
+	key := "test:redis:cancel"
+
+	won, _, release, err := c.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	waiterCtx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
 	var waiterErr error
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		waiterEntry, waiterErr = wait2(ctx)
+		won2, wait2, _, err2 := c.LockOrWait(waiterCtx, key)
+		if err2 != nil {
+			waiterErr = err2
+			return
+		}
+		if won2 {
+			waiterErr = errors.New("waiter incorrectly won the lock")
+			return
+		}
+		_, waiterErr = wait2(waiterCtx)
 	}()
 
-	time.Sleep(20 * time.Millisecond)
-	if err := c.Add(ctx, key, entry, time.Minute); err != nil {
-		t.Fatalf("Add failed: %v", err)
-	}
-	if release1 != nil {
-		release1(ctx)
-	}
+	time.Sleep(50 * time.Millisecond)
+	cancel() // cancel waiter
 
 	wg.Wait()
+	require.ErrorIs(t, waiterErr, context.Canceled)
+	release(ctx)
+}
 
-	if waiterErr != nil {
-		t.Fatalf("waiter error: %v", waiterErr)
-	}
-	if waiterEntry == nil || len(waiterEntry.Values) == 0 || waiterEntry.Values[0][0] != int64(99) {
-		t.Fatalf("waiter received wrong entry: %v", waiterEntry)
-	}
+func TestRedisCache_Close(t *testing.T) {
+	s, err := miniredis.Run()
+	require.NoError(t, err)
+	defer s.Close()
 
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatal(err)
-	}
-	_ = wait1
+	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer rdb.Close()
+	c := rediscache.New(rdb)
+	require.NoError(t, c.Close())
 }

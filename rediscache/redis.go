@@ -11,6 +11,11 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+var (
+	_ entcache.Cache          = (*Redis)(nil)
+	_ entcache.StampedeLocker = (*Redis)(nil)
+)
+
 // Redis provides a remote cache backed by go-redis.
 type Redis struct {
 	c     redis.Cmdable
@@ -78,6 +83,11 @@ func (r *Redis) Del(ctx context.Context, k entcache.Key) error {
 		return nil
 	}
 	return r.c.Del(ctx, key).Err()
+}
+
+// Close closes the cache.
+func (r *Redis) Close() error {
+	return nil
 }
 
 // LockOrWait implements StampedeLocker interface for rediscache.

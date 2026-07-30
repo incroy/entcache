@@ -11,6 +11,11 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+var (
+	_ entcache.Cache          = (*LRU)(nil)
+	_ entcache.StampedeLocker = (*LRU)(nil)
+)
+
 type (
 	// LRU provides a thread-safe LRU cache using hashicorp/golang-lru/v2.
 	LRU struct {
