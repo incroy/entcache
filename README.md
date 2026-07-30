@@ -105,20 +105,71 @@ client := ent.NewClient(ent.Driver(drv))
 
 ### 3. Multi-Level Cache
 
-A cache hierarchy structures cache stores by access speed and capacity (e.g. L1 in-memory LRU + L2 remote NATS KV/Redis). Lookups cascade down the hierarchy: L1 → L2 → Database. This is ideal for distributed microservices.
+A cache hierarchy structures cache stores by access speed and capacity (e.g. L1 in-memory + L2 remote). Lookups cascade down the hierarchy: L1 → L2 → Database. 
 
-![multi-level-cache](https://github.com/ariga/entcache/raw/assets/internal/assets/multilevel.png)
+Entcache supports a variety of backend adapters. Below are the supported cache architectures and their features:
+
+#### Rueidis (`rueidiscache`)
+[Rueidis](https://github.com/redis/rueidis) is a high-performance Redis client. 
+**Note:** You **do not** need to pair `rueidiscache` with `lrucache`. Rueidis natively supports **RESP3 Client-Side Caching**, meaning it automatically maintains an in-memory cache on the client-side and receives server-assisted invalidation pushes transparently!
+
+**Features:**
+- Native RESP3 Client-Side caching (no explicit LRU needed).
+- Distributed Stampede Protection using zero-network-call wait locks (via `DoCache`).
+- Automatic Server-Crash recovery mechanisms.
 
 ```go
+// Lookups: Rueidis In-Memory Map -> Redis Server -> Database
 drv := entcache.NewDriver(
     sqlDrv,
     entcache.TTL(time.Minute),
     entcache.Levels(
-        lrucache.MustNew(256),  // Level 1: fast in-process memory
-        natscache.New(kv),      // Level 2: durable NATS JetStream KV
+        rueidiscache.New(rueidisClient), // Acts as both L1 & L2 seamlessly
     ),
 )
-client := ent.NewClient(ent.Driver(drv))
+```
+
+#### Redis (`rediscache` / `go-redis`)
+Standard remote cache backed by the popular [go-redis](https://github.com/redis/go-redis) client. 
+
+**Features:**
+- Traditional L1/L2 multi-level cache architecture.
+- Distributed Stampede Protection with polling fallback.
+- **Keyspace Events:** Use `rediscache.WithKeyspaceEvents()` to eliminate polling and gracefully handle lock expirations during server crashes via Pub/Sub.
+
+```go
+// Lookups: L1 (LRU) -> L2 (go-redis) -> Database
+drv := entcache.NewDriver(
+    sqlDrv,
+    entcache.TTL(time.Minute),
+    entcache.Levels(
+        lrucache.MustNew(256), // Level 1: fast in-process memory
+        rediscache.New(
+            goRedisClient,
+            rediscache.WithKeyspaceEvents(), // Recommended for optimal stampede protection
+        ),                     // Level 2: Redis
+    ),
+)
+```
+
+#### NATS JetStream KV (`natscache`)
+Distributed cache backed by durable NATS JetStream KeyValue buckets.
+
+**Features:**
+- Masterless distributed architecture.
+- Distributed Stampede Protection via native NATS `Watch` events (`KeyValueDelete`).
+- Fault-tolerant background heartbeats for lock ownership tracking.
+
+```go
+// Lookups: L1 (LRU) -> L2 (NATS) -> Database
+drv := entcache.NewDriver(
+    sqlDrv,
+    entcache.TTL(time.Minute),
+    entcache.Levels(
+        lrucache.MustNew(256), // Level 1: fast in-process memory
+        natscache.New(kv),     // Level 2: durable NATS JetStream KV
+    ),
+)
 ```
 
 ---
