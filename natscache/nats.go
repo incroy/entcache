@@ -16,12 +16,12 @@ import (
 // NatsKV provides a remote cache backed by NATS JetStream KeyValue
 // with built-in distributed stampede locking and real-time Watch invalidations.
 type NatsKV struct {
-	kv       jetstream.KeyValue
-	locks    sync.Map // map[string]uint64
-	mu       sync.Mutex
-	id       string
-	ctx      context.Context
-	cancel   context.CancelFunc
+	kv     jetstream.KeyValue
+	locks  sync.Map // map[string]uint64
+	mu     sync.Mutex
+	id     string
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 var (
@@ -127,7 +127,7 @@ func (n *NatsKV) Add(ctx context.Context, k entcache.Key, e *entcache.Entry, ttl
 	} else {
 		_, err = n.kv.Put(ctx, key, buf)
 	}
-	
+
 	// If we hold the stampede lock, clear it to wake up waiters.
 	// This must happen AFTER data is written so they find it.
 	if rev, ok := n.locks.LoadAndDelete(key); ok {
@@ -229,7 +229,7 @@ func (n *NatsKV) LockOrWait(ctx context.Context, k entcache.Key) (bool, func(con
 			}
 			return nil, gErr
 		}
-		
+
 		holderID := string(kve.Value())
 		holderRev := kve.Revision()
 

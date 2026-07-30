@@ -3,19 +3,22 @@ package natscache_test
 import (
 	"context"
 	"database/sql/driver"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/incroy/entcache"
 	"github.com/incroy/entcache/natscache"
+	"github.com/nats-io/nats-server/v2/server"
 	natsserver "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/require"
 )
 
-func runEmbeddedNatsServer(t *testing.T) (*nats.Conn, jetstream.JetStream) {
+func runNatsServer(t *testing.T) *server.Server {
 	t.Helper()
 	opts := natsserver.DefaultTestOptions
 	opts.Port = -1
@@ -26,6 +29,11 @@ func runEmbeddedNatsServer(t *testing.T) (*nats.Conn, jetstream.JetStream) {
 	t.Cleanup(func() {
 		s.Shutdown()
 	})
+	return s
+}
+
+func makeNatsClient(t *testing.T, s *server.Server) (*nats.Conn, jetstream.JetStream) {
+	t.Helper()
 
 	nc, err := nats.Connect(s.ClientURL())
 	require.NoError(t, err, "failed to connect to embedded NATS server")
@@ -40,7 +48,8 @@ func runEmbeddedNatsServer(t *testing.T) (*nats.Conn, jetstream.JetStream) {
 
 func TestNatsCache_EmbeddedJetStream(t *testing.T) {
 	ctx := context.Background()
-	_, js := runEmbeddedNatsServer(t)
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
 
 	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:         "entcache_embedded_test",
@@ -93,7 +102,8 @@ func TestNatsCache_EmbeddedJetStream(t *testing.T) {
 
 func TestNatsLockOrWait_Stampede(t *testing.T) {
 	ctx := context.Background()
-	_, js := runEmbeddedNatsServer(t)
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
 
 	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:         "entcache_stampede_test",
@@ -145,7 +155,8 @@ func TestNatsLockOrWait_Stampede(t *testing.T) {
 
 func TestNatsLockOrWait_HeartbeatFailure(t *testing.T) {
 	ctx := context.Background()
-	_, js := runEmbeddedNatsServer(t)
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
 
 	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:         "entcache_heartbeat_test",
@@ -183,7 +194,8 @@ func TestNatsLockOrWait_HeartbeatFailure(t *testing.T) {
 
 func TestNatsLockOrWait_ConcurrentStealing(t *testing.T) {
 	ctx := context.Background()
-	_, js := runEmbeddedNatsServer(t)
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
 
 	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:         "entcache_concurrent_test",
@@ -228,9 +240,10 @@ func TestNatsLockOrWait_ConcurrentStealing(t *testing.T) {
 
 func TestNats_HeartbeatTTLRefresh(t *testing.T) {
 	ctx := context.Background()
-	_, js := runEmbeddedNatsServer(t)
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
 
-	_, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:         "entcache_heartbeat_ttl_test",
 		LimitMarkerTTL: 1 * time.Second,
 	})
@@ -240,11 +253,44 @@ func TestNats_HeartbeatTTLRefresh(t *testing.T) {
 	// so we will test the actual 10s TTL behavior. We'll simulate `keepalive()` directly
 	// or just wait. But waiting 15s in a unit test is slow.
 	// Let's test the `Add` TTL behavior first.
+	c := natscache.New(kv)
+	key := "test:nats:heartbeat_ttl"
+
+	won, _, release, err := c.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	// Since we hold the lock, the heartbeat should be running.
+	// The lock key is <sanitizedKey>_lock
+	sanitizedKey := strings.ReplaceAll(key, ":", "_")
+	lockKey := sanitizedKey + "_lock"
+	_, err = kv.Get(ctx, lockKey)
+	require.NoError(t, err)
+
+	// Initial TTL should be limit marker TTL, but actually JetStream KV doesn't let us easily query remaining TTL.
+	// We can't query the exact remaining TTL in NATS KV like we can in Redis.
+	// We know it was set to 10s based on NatsCache implementation, but the KV bucket default is 1s.
+	// Since NATS KV does not provide a `TTL()` method for keys, we can just ensure
+	// that after a sleep longer than the Bucket LimitMarkerTTL, the key still exists.
+
+	// Wait, the bucket LimitMarkerTTL was set to 1s in this test setup:
+	// LimitMarkerTTL: 1 * time.Second
+	// And the natscache heartbeat interval is 5s, which renews for another 10s.
+	// Wait, the heartbeat interval in natscache is hardcoded to 5s. If the limit marker is 1s, it might expire before the first tick!
+	// NATS KV TTL applies on write. natscache sets it to 10s.
+
+	time.Sleep(6 * time.Second) // wait for at least one heartbeat tick
+
+	_, err = kv.Get(ctx, lockKey)
+	require.NoError(t, err, "lock key should still exist after 6s because heartbeat renewed it")
+
+	release(ctx)
 }
 
 func TestNats_AddPreservesCustomTTL(t *testing.T) {
 	ctx := context.Background()
-	_, js := runEmbeddedNatsServer(t)
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
 
 	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:         "entcache_add_ttl_test",
@@ -285,7 +331,8 @@ func TestNats_AddPreservesCustomTTL(t *testing.T) {
 
 func TestNatsCacheDel(t *testing.T) {
 	ctx := context.Background()
-	_, js := runEmbeddedNatsServer(t)
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
 
 	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:         "entcache_del_test",
@@ -313,7 +360,8 @@ func TestNatsCacheDel(t *testing.T) {
 
 func TestNatsLockOrWait_ContextCancellation(t *testing.T) {
 	ctx := context.Background()
-	_, js := runEmbeddedNatsServer(t)
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
 
 	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:         "entcache_cancel_test",
@@ -343,7 +391,8 @@ func TestNatsLockOrWait_ContextCancellation(t *testing.T) {
 
 func TestNatsLockOrWait_Timeout(t *testing.T) {
 	ctx := context.Background()
-	_, js := runEmbeddedNatsServer(t)
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
 
 	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:         "entcache_timeout_test",
@@ -372,7 +421,8 @@ func TestNatsLockOrWait_Timeout(t *testing.T) {
 
 func TestNatsCloseCleanup(t *testing.T) {
 	ctx := context.Background()
-	_, js := runEmbeddedNatsServer(t)
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
 
 	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:         "entcache_cleanup_test",
@@ -380,7 +430,7 @@ func TestNatsCloseCleanup(t *testing.T) {
 	})
 	require.NoError(t, err)
 	c := natscache.New(kv)
-	
+
 	// Create a lock to spawn the heartbeat goroutine
 	won, _, _, err := c.LockOrWait(ctx, "test:nats:cleanup")
 	require.NoError(t, err)
@@ -389,8 +439,184 @@ func TestNatsCloseCleanup(t *testing.T) {
 	// Close the cache
 	c.Close()
 
-	// Wait a moment to ensure goroutine exits (no easy way to assert runtime.NumGoroutine without flakiness, 
+	// Wait a moment to ensure goroutine exits (no easy way to assert runtime.NumGoroutine without flakiness,
 	// but we can ensure Close doesn't panic and returns cleanly)
 	time.Sleep(50 * time.Millisecond)
 }
 
+func TestNatsLockOrWait_LoaderErrorRetry(t *testing.T) {
+	ctx := context.Background()
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
+
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:         "entcache_loader_err_test",
+		TTL:            10 * time.Minute,
+		LimitMarkerTTL: 1 * time.Second,
+	})
+	require.NoError(t, err)
+
+	c := natscache.New(kv)
+	key := "test:nats:loader_error"
+
+	won1, wait1, release1, err1 := c.LockOrWait(ctx, key)
+	require.NoError(t, err1)
+	require.True(t, won1)
+
+	won2, wait2, _, err2 := c.LockOrWait(ctx, key)
+	require.NoError(t, err2)
+	require.False(t, won2)
+
+	var wg sync.WaitGroup
+	var waiterErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, waiterErr = wait2(ctx)
+	}()
+
+	// Simulate Loader Error: Winner calls release() WITHOUT calling Add()
+	time.Sleep(50 * time.Millisecond)
+	release1(ctx)
+
+	wg.Wait()
+	// Waiter should retry!
+	require.ErrorIs(t, waiterErr, entcache.ErrRetryLocker)
+	_ = wait1
+}
+
+func TestNatsLockOrWait_MassiveStampede(t *testing.T) {
+	ctx := context.Background()
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
+
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:         "entcache_massive_stampede_test",
+		TTL:            10 * time.Minute,
+		LimitMarkerTTL: 1 * time.Second,
+	})
+	require.NoError(t, err)
+
+	c := natscache.New(kv)
+	key := "test:nats:massive_stampede"
+
+	var count int64
+	var wg sync.WaitGroup
+	var errs sync.Map
+
+	entry := &entcache.Entry{
+		Columns: []string{"id"},
+		Values:  [][]driver.Value{{int64(999)}},
+	}
+
+	for i := 0; i < 2000; i++ { // Use 2000 to prevent NATS from timing out locally
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			won, wait, release, err := c.LockOrWait(ctx, key)
+			if err != nil {
+				errs.Store(err, true)
+				return
+			}
+			if won {
+				atomic.AddInt64(&count, 1)
+				// Simulate slow query
+				time.Sleep(50 * time.Millisecond)
+				_ = c.Add(ctx, key, entry, time.Minute)
+				release(ctx)
+			} else {
+				got, err := wait(ctx)
+				if err != nil {
+					for err == entcache.ErrRetryLocker {
+						won, wait, release, err = c.LockOrWait(ctx, key)
+						if won {
+							atomic.AddInt64(&count, 1)
+							_ = c.Add(ctx, key, entry, time.Minute)
+							release(ctx)
+							return
+						}
+						if wait != nil {
+							got, err = wait(ctx)
+						}
+					}
+
+					if err != nil {
+						errs.Store(err, true)
+						return
+					}
+				}
+				if got == nil || len(got.Values) == 0 || got.Values[0][0] != int64(999) {
+					errs.Store("invalid entry returned", true)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	require.Equal(t, int64(1), count, "loader should only execute exactly once")
+
+	var hasErr bool
+	errs.Range(func(key, value any) bool {
+		t.Errorf("goroutine error: %v", key)
+		hasErr = true
+		return true
+	})
+	require.False(t, hasErr)
+}
+
+func TestNatsLockOrWait_StampedeServerCrash(t *testing.T) {
+	ctx := context.Background()
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
+
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:         "entcache_stampede_crash_test",
+		TTL:            10 * time.Minute,
+		LimitMarkerTTL: 1 * time.Second,
+	})
+	require.NoError(t, err)
+
+	c := natscache.New(kv)
+	key := "test:nats:stampede_crash"
+
+	var wg sync.WaitGroup
+	var errs sync.Map
+
+	entry := &entcache.Entry{
+		Columns: []string{"id"},
+		Values:  [][]driver.Value{{int64(999)}},
+	}
+
+	for i := 0; i < 2000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			won, wait, release, err := c.LockOrWait(ctx, key)
+			if err != nil {
+				return
+			}
+			if won {
+				time.Sleep(200 * time.Millisecond) // Simulate slow query
+				_ = c.Add(ctx, key, entry, time.Minute)
+				release(ctx)
+			} else {
+				_, waitErr := wait(ctx)
+				if waitErr != nil {
+					// We expect network errors or ErrRetryLocker when the server crashes
+				}
+			}
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	s.Shutdown() // CRASH!
+	wg.Wait()
+
+	var hasErr bool
+	errs.Range(func(key, value any) bool {
+		t.Errorf("goroutine error: %v", key)
+		hasErr = true
+		return true
+	})
+	require.False(t, hasErr)
+}

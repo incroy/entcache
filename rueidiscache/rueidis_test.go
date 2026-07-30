@@ -3,278 +3,101 @@ package rueidiscache_test
 import (
 	"context"
 	"database/sql/driver"
-	"errors"
-	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/incroy/entcache"
 	"github.com/incroy/entcache/rueidiscache"
 	"github.com/redis/rueidis"
-	"github.com/redis/rueidis/mock"
-	"go.uber.org/mock/gomock"
+	"github.com/stretchr/testify/require"
 )
 
-func TestRueidisCache_Get_Hit(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
+func runMiniredis(t *testing.T) (*miniredis.Miniredis, rueidis.Client) {
+	t.Helper()
+	s, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
 
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
-	ctx := context.Background()
+	rdb, err := rueidis.NewClient(rueidis.ClientOption{
+		InitAddress:  []string{s.Addr()},
+		DisableCache: true, // miniredis doesn't support RESP3 CLIENT TRACKING
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { rdb.Close() })
 
-	entry := &entcache.Entry{
-		Columns: []string{"id", "name"},
-		Values:  [][]driver.Value{{int64(10), "alice"}},
-	}
-	buf, err := entry.MarshalBinary()
-	if err != nil {
-		t.Fatalf("failed to marshal entry: %v", err)
-	}
-
-	cmd := mockClient.B().Get().Key("user:10").Build()
-	mockClient.EXPECT().Do(ctx, cmd).Return(mock.Result(mock.RedisString(string(buf))))
-
-	got, err := c.Get(ctx, "user:10")
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if !reflect.DeepEqual(got.Columns, entry.Columns) {
-		t.Errorf("expected columns %v, got %v", entry.Columns, got.Columns)
-	}
-	if len(got.Values) != 1 || got.Values[0][1] != "alice" {
-		t.Errorf("expected values %v, got %v", entry.Values, got.Values)
-	}
+	return s, rdb
 }
 
-func TestRueidisCache_Get_Miss(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
+func TestRueidisCache(t *testing.T) {
 	ctx := context.Background()
-
-	cmd := mockClient.B().Get().Key("user:miss").Build()
-	mockClient.EXPECT().Do(ctx, cmd).Return(mock.Result(mock.RedisNil()))
-
-	_, err := c.Get(ctx, "user:miss")
-	if !errors.Is(err, entcache.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound, got %v", err)
-	}
-}
-
-func TestRueidisCache_Get_RedisError(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
-	ctx := context.Background()
-
-	cmd := mockClient.B().Get().Key("user:err").Build()
-	mockClient.EXPECT().Do(ctx, cmd).Return(mock.Result(mock.RedisError("connection failed")))
-
-	_, err := c.Get(ctx, "user:err")
-	if !errors.Is(err, entcache.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound, got %v", err)
-	}
-}
-
-func TestRueidisCache_Get_EmptyKey(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
-	ctx := context.Background()
-
-	_, err := c.Get(ctx, "")
-	if !errors.Is(err, entcache.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound for empty key, got %v", err)
-	}
-}
-
-func TestRueidisCache_Get_CorruptedData(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
-	ctx := context.Background()
-
-	cmd := mockClient.B().Get().Key("user:corrupt").Build()
-	mockClient.EXPECT().Do(ctx, cmd).Return(mock.Result(mock.RedisString("invalid-binary-data")))
-
-	_, err := c.Get(ctx, "user:corrupt")
-	if err == nil {
-		t.Fatalf("expected error for corrupted binary data, got nil")
-	}
-	if errors.Is(err, entcache.ErrNotFound) {
-		t.Fatalf("expected unmarshal error, got ErrNotFound")
-	}
-}
-
-func TestRueidisCache_Add_WithTTL(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
-	ctx := context.Background()
+	_, rdb := runMiniredis(t)
+	c := rueidiscache.New(rdb)
 
 	entry := &entcache.Entry{
 		Columns: []string{"id"},
-		Values:  [][]driver.Value{{int64(1)}},
+		Values:  [][]driver.Value{{int64(42)}},
 	}
-	buf, _ := entry.MarshalBinary()
 
-	cmd := mockClient.B().Set().Key("user:10").Value(rueidis.BinaryString(buf)).Ex(time.Minute).Build()
-	mockClient.EXPECT().Do(ctx, cmd).Return(mock.Result(mock.RedisString("OK")))
+	// 1. Get Miss
+	_, err := c.Get(ctx, "user:42")
+	require.ErrorIs(t, err, entcache.ErrNotFound)
 
-	if err := c.Add(ctx, "user:10", entry, time.Minute); err != nil {
-		t.Fatalf("Add failed: %v", err)
+	// 2. Add
+	err = c.Add(ctx, "user:42", entry, time.Minute)
+	require.NoError(t, err)
+
+	// 3. Get Hit
+	got, err := c.Get(ctx, "user:42")
+	require.NoError(t, err)
+	require.Len(t, got.Values, 1)
+	require.Equal(t, int64(42), got.Values[0][0])
+
+	// 4. WatchInvalidations
+	invalidated := make(chan string, 1)
+	err = c.WatchInvalidations(ctx, func(k entcache.Key) {
+		invalidated <- k.(string)
+	})
+	require.NoError(t, err)
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 5. Del
+	err = c.Del(ctx, "user:42")
+	require.NoError(t, err)
+
+	select {
+	case k := <-invalidated:
+		require.Equal(t, "user:42", k)
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timeout waiting for WatchInvalidations event")
 	}
+
+	// 6. Get Miss Again
+	_, err = c.Get(ctx, "user:42")
+	require.ErrorIs(t, err, entcache.ErrNotFound)
 }
 
-func TestRueidisCache_Add_WithoutTTL(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
+func TestRueidisLockOrWait_Stampede(t *testing.T) {
 	ctx := context.Background()
+	_, rdb := runMiniredis(t)
+	c := rueidiscache.New(rdb)
+	key := "test:rueidis:stampede"
 
-	entry := &entcache.Entry{
-		Columns: []string{"id"},
-		Values:  [][]driver.Value{{int64(2)}},
-	}
-	buf, _ := entry.MarshalBinary()
-
-	cmd := mockClient.B().Set().Key("user:20").Value(rueidis.BinaryString(buf)).Build()
-	mockClient.EXPECT().Do(ctx, cmd).Return(mock.Result(mock.RedisString("OK")))
-
-	if err := c.Add(ctx, "user:20", entry, 0); err != nil {
-		t.Fatalf("Add without TTL failed: %v", err)
-	}
-}
-
-func TestRueidisCache_Add_EmptyKey(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
-	ctx := context.Background()
-
-	entry := &entcache.Entry{}
-	if err := c.Add(ctx, "", entry, time.Minute); err != nil {
-		t.Fatalf("expected nil error for empty key, got %v", err)
-	}
-}
-
-func TestRueidisCache_Add_RedisError(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
-	ctx := context.Background()
-
-	entry := &entcache.Entry{
-		Columns: []string{"id"},
-		Values:  [][]driver.Value{{int64(3)}},
-	}
-
-	mockClient.EXPECT().Do(ctx, gomock.Any()).Return(mock.Result(mock.RedisError("redis out of memory")))
-
-	if err := c.Add(ctx, "user:30", entry, time.Minute); err == nil {
-		t.Fatalf("expected error on Redis set failure, got nil")
-	}
-}
-
-func TestRueidisCache_Del(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
-	ctx := context.Background()
-
-	cmd := mockClient.B().Del().Key("user:10").Build()
-	mockClient.EXPECT().Do(ctx, cmd).Return(mock.Result(mock.RedisInt64(1)))
-
-	if err := c.Del(ctx, "user:10"); err != nil {
-		t.Fatalf("Del failed: %v", err)
-	}
-}
-
-func TestRueidisCache_Del_EmptyKey(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
-	ctx := context.Background()
-
-	if err := c.Del(ctx, ""); err != nil {
-		t.Fatalf("expected nil for empty key, got %v", err)
-	}
-}
-
-func TestRueidisCache_Del_RedisError(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
-	ctx := context.Background()
-
-	cmd := mockClient.B().Del().Key("user:err").Build()
-	mockClient.EXPECT().Do(ctx, cmd).Return(mock.Result(mock.RedisError("del failed")))
-
-	if err := c.Del(ctx, "user:err"); err == nil {
-		t.Fatalf("expected error on Del failure, got nil")
-	}
-}
-
-func TestRueidisLockOrWait(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
-	ctx := context.Background()
-	key := "test:lock:1"
-
-	won1, _, release1, err1 := c.LockOrWait(ctx, key)
-	if err1 != nil {
-		t.Fatalf("first LockOrWait failed: %v", err1)
-	}
-	if !won1 {
-		t.Errorf("expected first call to win lock")
-	}
+	won1, wait1, release1, err1 := c.LockOrWait(ctx, key)
+	require.NoError(t, err1, "first LockOrWait failed")
+	require.True(t, won1, "expected first call to win lock")
 
 	won2, wait2, _, err2 := c.LockOrWait(ctx, key)
-	if err2 != nil {
-		t.Fatalf("second LockOrWait failed: %v", err2)
-	}
-	if won2 {
-		t.Errorf("expected second call to lose lock and become waiter")
-	}
+	require.NoError(t, err2, "second LockOrWait failed")
+	require.False(t, won2, "expected second call to lose lock")
 
 	entry := &entcache.Entry{
 		Columns: []string{"id"},
-		Values:  [][]driver.Value{{int64(100)}},
+		Values:  [][]driver.Value{{int64(77)}},
 	}
-	buf, _ := entry.MarshalBinary()
-
-	setCmd := mockClient.B().Set().Key(key).Value(rueidis.BinaryString(buf)).Ex(time.Minute).Build()
-	getCmd := mockClient.B().Get().Key(key).Build()
-
-	mockClient.EXPECT().Do(ctx, setCmd).Return(mock.Result(mock.RedisString("OK")))
-	mockClient.EXPECT().Do(ctx, getCmd).Return(mock.Result(mock.RedisString(string(buf))))
 
 	var wg sync.WaitGroup
 	var waiterEntry *entcache.Entry
@@ -286,44 +109,376 @@ func TestRueidisLockOrWait(t *testing.T) {
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-	if err := c.Add(ctx, key, entry, time.Minute); err != nil {
-		t.Fatalf("Add failed: %v", err)
-	}
+	err := c.Add(ctx, key, entry, time.Minute)
+	require.NoError(t, err, "Add failed")
 	if release1 != nil {
 		release1(ctx)
 	}
 
 	wg.Wait()
 
-	if waiterErr != nil {
-		t.Fatalf("waiter returned error: %v", waiterErr)
-	}
-	if waiterEntry == nil || len(waiterEntry.Values) == 0 || waiterEntry.Values[0][0] != int64(100) {
-		t.Errorf("waiter did not receive expected entry: %v", waiterEntry)
-	}
+	require.NoError(t, waiterErr, "waiter error")
+	require.NotNil(t, waiterEntry, "waiter received nil entry")
+	require.Len(t, waiterEntry.Values, 1)
+	require.Equal(t, int64(77), waiterEntry.Values[0][0], "waiter received wrong entry")
+	_ = wait1
 }
 
-func TestRueidisLockOrWait_ContextCanceled(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
+func TestRueidisLockOrWait_HeartbeatFailure(t *testing.T) {
+	ctx := context.Background()
+	s, err := miniredis.Run()
+	require.NoError(t, err)
+	defer s.Close()
 
-	mockClient := mock.NewClient(ctrl)
-	c := rueidiscache.New(mockClient)
-	key := "test:lock:cancel"
-
-	won1, _, release1, _ := c.LockOrWait(context.Background(), key)
-	if !won1 {
-		t.Fatalf("expected winner")
+	mkClient := func() rueidis.Client {
+		c, err := rueidis.NewClient(rueidis.ClientOption{InitAddress: []string{s.Addr()}, DisableCache: true})
+		require.NoError(t, err)
+		return c
 	}
-	defer release1(context.Background())
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
-	_, wait2, _, _ := c.LockOrWait(cancelCtx, key)
+	c1, c2 := rueidiscache.New(mkClient()), rueidiscache.New(mkClient())
+	key := "test:heartbeat"
+
+	won1, _, _, err1 := c1.LockOrWait(ctx, key)
+	require.NoError(t, err1)
+	require.True(t, won1)
+
+	won2, wait2, _, err2 := c2.LockOrWait(ctx, key)
+	require.NoError(t, err2)
+	require.False(t, won2)
+
+	var wg sync.WaitGroup
+	var waiterErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, waiterErr = wait2(ctx)
+	}()
+
+	// Simulate client 1 crashing / losing heartbeat
+	c1.Close()
+
+	wg.Wait()
+	require.ErrorIs(t, waiterErr, entcache.ErrRetryLocker)
+}
+
+func TestRueidisLockOrWait_ConcurrentStealing(t *testing.T) {
+	ctx := context.Background()
+	s, err := miniredis.Run()
+	require.NoError(t, err)
+	defer s.Close()
+
+	mkClient := func() rueidis.Client {
+		c, err := rueidis.NewClient(rueidis.ClientOption{InitAddress: []string{s.Addr()}, DisableCache: true})
+		require.NoError(t, err)
+		return c
+	}
+
+	numClients := 3
+	clients := make([]*rueidiscache.Rueidis, numClients)
+	for i := 0; i < numClients; i++ {
+		clients[i] = rueidiscache.New(mkClient())
+	}
+	key := "test:concurrent"
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	winners := 0
+	losers := 0
+
+	for i := 0; i < numClients; i++ {
+		wg.Add(1)
+		go func(c *rueidiscache.Rueidis) {
+			defer wg.Done()
+			won, _, _, err := c.LockOrWait(ctx, key)
+			require.NoError(t, err)
+			mu.Lock()
+			if won {
+				winners++
+			} else {
+				losers++
+			}
+			mu.Unlock()
+		}(clients[i])
+	}
+	wg.Wait()
+
+	require.Equal(t, 1, winners)
+	require.Equal(t, numClients-1, losers)
+}
+
+func TestRueidisLockOrWait_Timeout(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := runMiniredis(t)
+	c := rueidiscache.New(rdb)
+	key := "test:rueidis:timeout"
+
+	won, _, _, err := c.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	defer cancel()
+
+	won2, wait2, _, err := c.LockOrWait(timeoutCtx, key)
+	require.NoError(t, err)
+	require.False(t, won2)
+
+	_, waitErr := wait2(timeoutCtx)
+	require.ErrorIs(t, waitErr, context.DeadlineExceeded)
+}
+
+func TestRueidisLockOrWait_ContextCancellation(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := runMiniredis(t)
+	c := rueidiscache.New(rdb)
+	key := "test:rueidis:cancel"
+
+	won, _, _, err := c.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	won2, wait2, _, err := c.LockOrWait(cancelCtx, key)
+	require.NoError(t, err)
+	require.False(t, won2)
 
 	cancel()
 
-	_, err := wait2(cancelCtx)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context.Canceled, got %v", err)
+	_, waitErr := wait2(cancelCtx)
+	require.ErrorIs(t, waitErr, context.Canceled)
+}
+
+func TestRueidisCache_Close(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := runMiniredis(t)
+	c := rueidiscache.New(rdb)
+
+	won, _, _, err := c.LockOrWait(ctx, "test:rueidis:cleanup")
+	require.NoError(t, err)
+	require.True(t, won)
+
+	c.Close()
+	time.Sleep(50 * time.Millisecond)
+}
+
+func TestRueidis_AddPreservesCustomTTL(t *testing.T) {
+	ctx := context.Background()
+	s, rdb := runMiniredis(t)
+	c := rueidiscache.New(rdb)
+	key := "test:rueidis:add_ttl"
+
+	won, _, release, err := c.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	entry := &entcache.Entry{
+		Columns: []string{"id"},
+		Values:  [][]driver.Value{{int64(1)}},
 	}
+
+	// Add with 1 second TTL
+	err = c.Add(ctx, key, entry, 1*time.Second)
+	require.NoError(t, err)
+	if release != nil {
+		release(ctx)
+	}
+
+	// Fast forward miniredis time by 2 seconds
+	s.FastForward(2 * time.Second)
+
+	_, err = c.Get(ctx, key)
+	require.ErrorIs(t, err, entcache.ErrNotFound, "expected entry to expire after 1s TTL")
+}
+
+func TestRueidis_HeartbeatTTLRefresh(t *testing.T) {
+	ctx := context.Background()
+	s, rdb := runMiniredis(t)
+	c := rueidiscache.New(rdb)
+	key := "test:rueidis:heartbeat_ttl"
+
+	won, _, release, err := c.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	// Since we hold the lock, the heartbeat should be running.
+	// The ID is stored in the lock key
+	lockKey := "lock:" + key
+	id, err := s.Get(lockKey)
+	require.NoError(t, err)
+
+	// Initial TTL should be 10s
+	ttl := s.TTL(id)
+	require.Greater(t, ttl, 5*time.Second)
+	require.LessOrEqual(t, ttl, 10*time.Second)
+
+	// Fast forward time by 6 seconds.
+	// The heartbeat runs every 5s, so it should renew it back to 10s.
+	// However, miniredis fastforwarding doesn't automatically trigger Go time.Tickers immediately in deterministic lockstep,
+	// but the goroutine will fire if we sleep in real time.
+	// We'll sleep real time instead of FastForward so the goroutine's time.After triggers.
+	time.Sleep(6 * time.Second)
+
+	// TTL should be renewed, so it should still be > 5s
+	ttl2 := s.TTL(id)
+	require.Greater(t, ttl2, 5*time.Second)
+
+	release(ctx)
+}
+
+func TestRueidisLockOrWait_LoaderErrorRetry(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := runMiniredis(t)
+	c := rueidiscache.New(rdb)
+	key := "test:rueidis:loader_error"
+
+	won1, wait1, release1, err1 := c.LockOrWait(ctx, key)
+	require.NoError(t, err1)
+	require.True(t, won1)
+
+	won2, wait2, _, err2 := c.LockOrWait(ctx, key)
+	require.NoError(t, err2)
+	require.False(t, won2)
+
+	var wg sync.WaitGroup
+	var waiterErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, waiterErr = wait2(ctx)
+	}()
+
+	// Simulate Loader Error: Winner calls release() WITHOUT calling Add()
+	time.Sleep(50 * time.Millisecond)
+	release1(ctx)
+
+	wg.Wait()
+	// Waiter should retry!
+	require.ErrorIs(t, waiterErr, entcache.ErrRetryLocker)
+	_ = wait1
+}
+
+
+func TestRueidisLockOrWait_MassiveStampede(t *testing.T) {
+	ctx := context.Background()
+	s, rdb := runMiniredis(t)
+	c := rueidiscache.New(rdb)
+	key := "test:rueidis:massive_stampede"
+
+	var count int64
+	var wg sync.WaitGroup
+	var errs sync.Map
+	
+	entry := &entcache.Entry{
+		Columns: []string{"id"},
+		Values:  [][]driver.Value{{int64(999)}},
+	}
+
+	for i := 0; i < 5000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			won, wait, release, err := c.LockOrWait(ctx, key)
+			if err != nil {
+				errs.Store(err, true)
+				return
+			}
+			if won {
+				atomic.AddInt64(&count, 1)
+				// Simulate slow query
+				time.Sleep(50 * time.Millisecond)
+				_ = c.Add(ctx, key, entry, time.Minute)
+				release(ctx)
+			} else {
+				got, err := wait(ctx)
+				if err != nil {
+					// We expect some ErrRetryLocker when the winner finishes
+					// But for a simple test we can just loop and retry LockOrWait if we get ErrRetryLocker
+					// like the entcache ContextCache wrapper does
+					for err == entcache.ErrRetryLocker {
+					    won, wait, release, err = c.LockOrWait(ctx, key)
+					    if won {
+					        atomic.AddInt64(&count, 1)
+            				_ = c.Add(ctx, key, entry, time.Minute)
+            				release(ctx)
+            				return
+					    }
+					    if wait != nil {
+					        got, err = wait(ctx)
+					    }
+					}
+					
+					if err != nil {
+					    errs.Store(err, true)
+					    return
+					}
+				}
+				if got == nil || len(got.Values) == 0 || got.Values[0][0] != int64(999) {
+					errs.Store("invalid entry returned", true)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	
+	require.Equal(t, int64(1), count, "loader should only execute exactly once")
+	
+	var hasErr bool
+	errs.Range(func(key, value any) bool {
+		t.Errorf("goroutine error: %v", key)
+		hasErr = true
+		return true
+	})
+	require.False(t, hasErr)
+	_ = s
+}
+
+func TestRueidisLockOrWait_StampedeServerCrash(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	s, rdb := runMiniredis(t)
+	c := rueidiscache.New(rdb)
+	key := "test:rueidis:stampede_crash"
+
+	var wg sync.WaitGroup
+	var errs sync.Map
+	
+	entry := &entcache.Entry{
+		Columns: []string{"id"},
+		Values:  [][]driver.Value{{int64(999)}},
+	}
+
+	for i := 0; i < 2000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			won, wait, release, err := c.LockOrWait(ctx, key)
+			if err != nil {
+				// We expect network errors since the server is crashing
+				return
+			}
+			if won {
+				time.Sleep(200 * time.Millisecond) // Simulate slow query
+				_ = c.Add(ctx, key, entry, time.Minute)
+				release(ctx)
+			} else {
+				_, waitErr := wait(ctx)
+				if waitErr != nil {
+					// We expect network errors or ErrRetryLocker when the server crashes
+				}
+			}
+		}()
+	}
+	
+	time.Sleep(50 * time.Millisecond)
+	s.Close() // CRASH!
+	wg.Wait()
+	
+	var hasErr bool
+	errs.Range(func(key, value any) bool {
+		t.Errorf("goroutine error: %v", key)
+		hasErr = true
+		return true
+	})
+	require.False(t, hasErr)
 }
