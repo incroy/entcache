@@ -13,6 +13,7 @@ type multiLevel struct {
 var (
 	_ Cache          = (*multiLevel)(nil)
 	_ StampedeLocker = (*multiLevel)(nil)
+	_ Invalidator    = (*multiLevel)(nil)
 )
 
 // Add adds the entry to the cache.
@@ -56,4 +57,19 @@ func (m *multiLevel) LockOrWait(ctx context.Context, k Key) (bool, func(context.
 		}
 	}
 	return true, nil, nil, nil
+}
+
+// WatchInvalidations implements Invalidator interface for multiLevel cache.
+func (m *multiLevel) WatchInvalidations(ctx context.Context, onInvalidate func(key Key)) error {
+	for i := range m.levels {
+		if inv, ok := m.levels[i].(Invalidator); ok {
+			_ = inv.WatchInvalidations(ctx, func(k Key) {
+				_ = m.Del(ctx, k)
+				if onInvalidate != nil {
+					onInvalidate(k)
+				}
+			})
+		}
+	}
+	return nil
 }
