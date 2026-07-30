@@ -3,17 +3,54 @@ package entcache
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 )
 
 type ctxKey struct{}
+
+type memoryCache struct {
+	mu    sync.RWMutex
+	items map[string]*Entry
+}
+
+func newMemoryCache() *memoryCache {
+	return &memoryCache{items: make(map[string]*Entry)}
+}
+
+func (m *memoryCache) Get(_ context.Context, k Key) (*Entry, error) {
+	key := fmt.Sprint(k)
+	m.mu.RLock()
+	e, ok := m.items[key]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return e, nil
+}
+
+func (m *memoryCache) Add(_ context.Context, k Key, e *Entry, _ time.Duration) error {
+	key := fmt.Sprint(k)
+	m.mu.Lock()
+	m.items[key] = e
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *memoryCache) Del(_ context.Context, k Key) error {
+	key := fmt.Sprint(k)
+	m.mu.Lock()
+	delete(m.items, key)
+	m.mu.Unlock()
+	return nil
+}
 
 // NewContext returns a new Context that carries a cache.
 func NewContext(ctx context.Context, levels ...AddGetDeleter) context.Context {
 	var cache AddGetDeleter
 	switch len(levels) {
 	case 0:
-		cache = NewLRU(0)
+		cache = newMemoryCache()
 	case 1:
 		cache = levels[0]
 	default:

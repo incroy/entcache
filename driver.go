@@ -31,8 +31,7 @@ type (
 		KeyTTL time.Duration
 
 		// Cache defines the GetAddDeleter (cache implementation)
-		// for holding the cache entries. If no cache implementation
-		// was provided, an LRU cache with no limit is used.
+		// for holding the cache entries.
 		Cache AddGetDeleter
 
 		// Hash defines an optional Hash function for converting
@@ -64,50 +63,42 @@ type (
 	}
 )
 
-// NewDriver returns a new Driver an existing driver and optional
-// configuration functions. For example:
-//
-//	entcache.NewDriver(
-//		drv,
-//		entcache.TTL(time.Minute),
-//		entcache.Levels(
-//			NewLRU(256),
-//			NewRedis(redis.NewClient(&redis.Options{
-//				Addr: ":6379",
-//			})),
-//		),
-//	)
+// NewDriver returns a new Driver given an existing driver and optional
+// configuration functions.
 func NewDriver(drv dialect.Driver, opts ...Option) *Driver {
-	options := &Options{Hash: DefaultHash, Cache: NewLRU(0)}
+	options := &Options{Hash: DefaultHash}
 	for _, opt := range opts {
 		opt(options)
 	}
-	return &Driver{
+	d := &Driver{
 		Driver:  drv,
 		Options: options,
 	}
+	if inv, ok := d.Cache.(Invalidator); ok {
+		_ = inv.WatchInvalidations(context.Background(), func(k Key) {
+			if d.ChangeSet != nil {
+				d.ChangeSet.Mark(k)
+			}
+		})
+	}
+	return d
 }
 
-// TTL configures the period of time that an Entry
-// is valid in the cache.
+// TTL configures the period of time that an Entry is valid in the cache.
 func TTL(ttl time.Duration) Option {
 	return func(o *Options) {
 		o.TTL = ttl
 	}
 }
 
-// WithKeyTTL configures a separate TTL for key-addressed queries (e.g.
-// Get-by-ID). Key-addressed queries can have a longer TTL because they
-// are precisely invalidated via the ChangeSet. If not set, the regular
-// TTL is used.
+// WithKeyTTL configures a separate TTL for key-addressed queries (e.g. Get-by-ID).
 func WithKeyTTL(ttl time.Duration) Option {
 	return func(o *Options) {
 		o.KeyTTL = ttl
 	}
 }
 
-// Hash configures an optional Hash function for
-// converting a query and its arguments to a cache key.
+// Hash configures an optional Hash function for converting query + args to cache key.
 func Hash(hash func(query string, args []any) (Key, error)) Option {
 	return func(o *Options) {
 		o.Hash = hash
@@ -115,7 +106,6 @@ func Hash(hash func(query string, args []any) (Key, error)) Option {
 }
 
 // Levels configures the Driver to work with the given cache levels.
-// For example, in process LRU cache and a remote Redis cache.
 func Levels(levels ...AddGetDeleter) Option {
 	return func(o *Options) {
 		if len(levels) == 1 {
@@ -127,12 +117,6 @@ func Levels(levels ...AddGetDeleter) Option {
 }
 
 // ContextLevel configures the driver to work with context/request level cache.
-// Users that use this option, should wraps the *http.Request context with the
-// cache value as follows:
-//
-//	ctx = entcache.NewContext(ctx)
-//
-//	ctx = entcache.NewContext(ctx, entcache.NewLRU(128))
 func ContextLevel() Option {
 	return func(o *Options) {
 		o.Cache = &contextLevel{}
@@ -147,17 +131,11 @@ func WithChangeSet(cs *ChangeSet) Option {
 	}
 }
 
-// Query implements the Querier interface for the driver. It falls back to the
-// underlying wrapped driver in case of caching error.
-//
-// Stampede protection: concurrent identical queries are deduplicated via
-// singleflight. Only the first caller hits the database; others receive
-// the same result.
+// Query implements the Querier interface for the driver.
 func (d *Driver) Query(ctx context.Context, query string, args, v any) error {
-	// Check if the given statement looks like a standard Ent query (e.g. SELECT).
-	// Custom queries (e.g. CTE) or statements that are prefixed with comments are
-	// not supported. This check is mainly necessary, because PostgreSQL and SQLite
-	// may execute insert statement like "INSERT ... RETURNING" using Driver.Query.
+	if d.Cache == nil {
+		return d.Driver.Query(ctx, query, args, v)
+	}
 	if !strings.HasPrefix(query, "SELECT") && !strings.HasPrefix(query, "select") {
 		return d.Driver.Query(ctx, query, args, v)
 	}
@@ -178,41 +156,80 @@ func (d *Driver) Query(ctx context.Context, query string, args, v any) error {
 	// Check cache, with ChangeSet-aware invalidation.
 	e, cacheErr := d.Cache.Get(ctx, opts.key)
 	if cacheErr == nil && d.ChangeSet != nil && opts.ref {
-		// For key-addressed queries, check if the entry has been
-		// invalidated by a recent mutation.
 		if d.ChangeSet.Changed(opts.key, time.Now().Add(-opts.ttl)) {
-			// Entry is stale — evict and treat as a miss.
 			_ = d.Cache.Del(ctx, opts.key)
 			d.ChangeSet.Clear(opts.key)
 			cacheErr = ErrNotFound
 		}
 	}
 
-	switch {
-	case cacheErr == nil:
+	if cacheErr == nil {
 		atomic.AddUint64(&d.stats.Hits, 1)
 		vr.ColumnScanner = &repeater{columns: e.Columns, values: e.Values}
-	case cacheErr == ErrNotFound:
-		if err := d.Driver.Query(ctx, query, args, vr); err != nil {
-			return err
-		}
-		vr.ColumnScanner = &recorder{
-			ColumnScanner: vr.ColumnScanner,
-			skipNotFound:  opts.skipNotFound,
-			onClose: func(columns []string, values [][]driver.Value) {
-				err := d.Cache.Add(ctx, opts.key, &Entry{Columns: columns, Values: values}, opts.ttl)
-				if err != nil && d.Log != nil {
-					atomic.AddUint64(&d.stats.Errors, 1)
-					d.Log(fmt.Sprintf("entcache: failed storing entry %v in cache: %v", opts.key, err))
-				}
-				// Clear the ChangeSet marker now that we've refreshed.
-				if d.ChangeSet != nil && opts.ref {
-					d.ChangeSet.Clear(opts.key)
-				}
-			},
-		}
-	default:
+		return nil
+	}
+
+	if cacheErr != ErrNotFound {
 		return d.Driver.Query(ctx, query, args, v)
+	}
+
+	// Cache Miss: execute query with built-in stampede protection.
+	return d.queryWithStampedeLock(ctx, query, args, vr, opts)
+}
+
+func (d *Driver) queryWithStampedeLock(ctx context.Context, query string, args any, vr *sql.Rows, opts ctxOptions) error {
+	// If backend implements StampedeLocker (e.g. natscache or rueidiscache)
+	if locker, ok := d.Cache.(StampedeLocker); ok {
+		won, wait, release, err := locker.LockOrWait(ctx, opts.key)
+		if err == nil {
+			if !won {
+				// Another node/caller is loading — block on wait() until populated
+				e, err := wait(ctx)
+				if err == nil && e != nil {
+					atomic.AddUint64(&d.stats.Hits, 1)
+					vr.ColumnScanner = &repeater{columns: e.Columns, values: e.Values}
+					return nil
+				}
+				// Fallback to querying DB if wait failed or key was cleared
+			} else if release != nil {
+				defer release(ctx)
+			}
+		}
+	} else {
+		// Singleflight deduplication for in-process stampede protection
+		keyStr := fmt.Sprint(opts.key)
+		res, err, _ := d.group.Do(keyStr, func() (any, error) {
+			// Fast check if another goroutine in singleflight already wrote to cache
+			if e, err := d.Cache.Get(ctx, opts.key); err == nil {
+				return e, nil
+			}
+			return nil, ErrNotFound
+		})
+		if err == nil && res != nil {
+			if e, ok := res.(*Entry); ok {
+				atomic.AddUint64(&d.stats.Hits, 1)
+				vr.ColumnScanner = &repeater{columns: e.Columns, values: e.Values}
+				return nil
+			}
+		}
+	}
+
+	if err := d.Driver.Query(ctx, query, args, vr); err != nil {
+		return err
+	}
+	vr.ColumnScanner = &recorder{
+		ColumnScanner: vr.ColumnScanner,
+		skipNotFound:  opts.skipNotFound,
+		onClose: func(columns []string, values [][]driver.Value) {
+			err := d.Cache.Add(ctx, opts.key, &Entry{Columns: columns, Values: values}, opts.ttl)
+			if err != nil && d.Log != nil {
+				atomic.AddUint64(&d.stats.Errors, 1)
+				d.Log(fmt.Sprintf("entcache: failed storing entry %v in cache: %v", opts.key, err))
+			}
+			if d.ChangeSet != nil && opts.ref {
+				d.ChangeSet.Clear(opts.key)
+			}
+		},
 	}
 	return nil
 }
@@ -226,8 +243,7 @@ func (d *Driver) Stats() Stats {
 	}
 }
 
-// QueryContext calls QueryContext of the underlying driver, or fails if it is not supported.
-// Note, this method is not part of the caching layer since Ent does not use it by default.
+// QueryContext calls QueryContext of underlying driver.
 func (d *Driver) QueryContext(ctx context.Context, query string, args ...any) (*stdsql.Rows, error) {
 	drv, ok := d.Driver.(interface {
 		QueryContext(context.Context, string, ...any) (*stdsql.Rows, error)
@@ -238,7 +254,7 @@ func (d *Driver) QueryContext(ctx context.Context, query string, args ...any) (*
 	return drv.QueryContext(ctx, query, args...)
 }
 
-// ExecContext calls ExecContext of the underlying driver, or fails if it is not supported.
+// ExecContext calls ExecContext of underlying driver.
 func (d *Driver) ExecContext(ctx context.Context, query string, args ...any) (stdsql.Result, error) {
 	drv, ok := d.Driver.(interface {
 		ExecContext(context.Context, string, ...any) (stdsql.Result, error)
@@ -249,10 +265,8 @@ func (d *Driver) ExecContext(ctx context.Context, query string, args ...any) (st
 	return drv.ExecContext(ctx, query, args...)
 }
 
-// errSkip tells the driver to skip cache layer.
 var errSkip = errors.New("entcache: skip cache")
 
-// optionsFromContext returns the injected options from the context, or its default value.
 func (d *Driver) optionsFromContext(ctx context.Context, query string, args []any) (ctxOptions, error) {
 	var opts ctxOptions
 	if c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions); ok {
@@ -283,8 +297,7 @@ func (d *Driver) optionsFromContext(ctx context.Context, query string, args []an
 	return opts, nil
 }
 
-// DefaultHash provides the default implementation for converting
-// a query and its argument to a cache key.
+// DefaultHash provides the default implementation for converting a query + args to a cache key.
 func DefaultHash(query string, args []any) (Key, error) {
 	key, err := hashstructure.Hash(struct {
 		Q string
@@ -306,8 +319,6 @@ type Stats struct {
 	Errors uint64
 }
 
-// rawCopy copies the driver values by implementing
-// the sql.Scanner interface.
 type rawCopy struct {
 	values []driver.Value
 }
@@ -323,8 +334,6 @@ func (c *rawCopy) Scan(src interface{}) error {
 	return nil
 }
 
-// recorder represents an sql.Rows recorder that implements
-// the entgo.io/ent/dialect/sql.ColumnScanner interface.
 type recorder struct {
 	sql.ColumnScanner
 	values       [][]driver.Value
@@ -334,16 +343,12 @@ type recorder struct {
 	onClose      func([]string, [][]driver.Value)
 }
 
-// Next wraps the underlying Next method
 func (r *recorder) Next() bool {
 	hasNext := r.ColumnScanner.Next()
 	r.done = !hasNext
 	return hasNext
 }
 
-// Scan copies database values for future use (by the repeater)
-// and assign them to the given destinations using the standard
-// database/sql.convertAssign function.
 func (r *recorder) Scan(dest ...any) error {
 	values := make([]driver.Value, len(dest))
 	args := make([]any, len(dest))
@@ -363,9 +368,6 @@ func (r *recorder) Scan(dest ...any) error {
 	return nil
 }
 
-// Columns wraps the underlying Column method and stores it in the recorder state.
-// The repeater.Columns cannot be called if the recorder method was not called before.
-// That means, raw scanning should be identical for identical queries.
 func (r *recorder) Columns() ([]string, error) {
 	columns, err := r.ColumnScanner.Columns()
 	if err != nil {
@@ -379,10 +381,7 @@ func (r *recorder) Close() error {
 	if err := r.ColumnScanner.Close(); err != nil {
 		return err
 	}
-	// If we did not encounter any error during iteration,
-	// and we scanned all rows, we store it on cache.
 	if err := r.ColumnScanner.Err(); err == nil || r.done {
-		// Skip caching if skipNotFound is set and no rows were scanned.
 		if r.skipNotFound && len(r.values) == 0 {
 			return nil
 		}
@@ -391,7 +390,6 @@ func (r *recorder) Close() error {
 	return nil
 }
 
-// repeater repeats columns scanning from cache history.
 type repeater struct {
 	columns []string
 	values  [][]driver.Value

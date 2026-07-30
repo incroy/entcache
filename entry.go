@@ -28,6 +28,26 @@ type (
 		Add(ctx context.Context, k Key, e *Entry, ttl time.Duration) error
 		Get(ctx context.Context, k Key) (*Entry, error)
 	}
+
+	// StampedeLocker defines an interface for distributed or local lock-waiting
+	// on cache misses to prevent cache stampedes.
+	StampedeLocker interface {
+		// LockOrWait attempts to acquire permission to load a missing key.
+		// If won == true: caller runs the DB query, calls Add(), then calls release(ctx).
+		// If won == false: wait(ctx) blocks until another caller populates the cache and returns the Entry.
+		LockOrWait(ctx context.Context, k Key) (won bool, wait func(context.Context) (*Entry, error), release func(context.Context), err error)
+	}
+
+	// Invalidator defines an interface for real-time invalidation event streaming.
+	Invalidator interface {
+		// WatchInvalidations registers a callback that triggers when a key is modified or deleted remotely.
+		WatchInvalidations(ctx context.Context, onInvalidate func(key Key)) error
+	}
+
+	// Cache combines AddGetDeleter with optional StampedeLocker and Invalidator.
+	Cache interface {
+		AddGetDeleter
+	}
 )
 
 func init() {
