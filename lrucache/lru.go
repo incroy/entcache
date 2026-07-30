@@ -14,7 +14,7 @@ import (
 type (
 	// LRU provides a thread-safe LRU cache using hashicorp/golang-lru/v2.
 	LRU struct {
-		cache *lru.Cache[string, any]
+		cache *lru.Cache[string, *entry]
 		group singleflight.Group
 		mu    sync.Mutex
 		waits map[string]chan struct{}
@@ -36,7 +36,7 @@ func New(maxEntries int) (*LRU, error) {
 	if maxEntries <= 0 {
 		maxEntries = 1000
 	}
-	c, err := lru.New[string, any](maxEntries)
+	c, err := lru.New[string, *entry](maxEntries)
 	if err != nil {
 		return nil, err
 	}
@@ -69,11 +69,11 @@ func (l *LRU) Add(ctx context.Context, k entcache.Key, e *entcache.Entry, ttl ti
 	if err := ne.UnmarshalBinary(buf); err != nil {
 		return err
 	}
-	if ttl == 0 {
-		l.cache.Add(key, ne)
-	} else {
-		l.cache.Add(key, &entry{Entry: ne, expiry: time.Now().Add(ttl)})
+	var exp time.Time
+	if ttl != 0 {
+		exp = time.Now().Add(ttl)
 	}
+	l.cache.Add(key, &entry{Entry: ne, expiry: exp})
 	l.mu.Lock()
 	if ch, ok := l.waits[key]; ok {
 		close(ch)
@@ -89,22 +89,15 @@ func (l *LRU) Get(ctx context.Context, k entcache.Key) (*entcache.Entry, error) 
 	if key == "" {
 		return nil, entcache.ErrNotFound
 	}
-	val, ok := l.cache.Get(key)
+	e, ok := l.cache.Get(key)
 	if !ok {
 		return nil, entcache.ErrNotFound
 	}
-	switch e := val.(type) {
-	case *entcache.Entry:
-		return e, nil
-	case *entry:
-		if time.Now().Before(e.expiry) {
-			return e.Entry, nil
-		}
+	if !e.expiry.IsZero() && time.Now().After(e.expiry) {
 		l.cache.Remove(key)
 		return nil, entcache.ErrNotFound
-	default:
-		return nil, fmt.Errorf("entcache/lrucache: unexpected entry type: %T", e)
 	}
+	return e.Entry, nil
 }
 
 // Del deletes an entry from the cache.
