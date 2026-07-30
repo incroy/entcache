@@ -291,6 +291,21 @@ A full runnable server example is located in [examples/ctxlevel](examples/ctxlev
 
 ---
 
+### Driver-Level Cache
+
+Embedded directly in `ent.Client` via `entcache.NewDriver`. The driver-level cache is process-scoped and shared across all goroutines in the application process.
+
+```go
+drv := entcache.NewDriver(
+    sqlDrv,
+    entcache.TTL(time.Minute),
+    entcache.Levels(lrucache.MustNew(1000)),
+)
+client := ent.NewClient(ent.Driver(drv))
+```
+
+---
+
 ### Multi-Level Cache
 
 A cache hierarchy structures cache stores by access speed and capacity (e.g. L1 in-memory LRU + L2 remote NATS KV/Redis). Lookups cascade down the hierarchy: L1 → L2 → Database.
