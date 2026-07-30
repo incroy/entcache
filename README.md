@@ -112,6 +112,8 @@ client := ent.NewClient(ent.Driver(drv))
 
 A cache hierarchy structures cache stores by access speed and capacity (e.g. L1 in-memory + L2 remote). Lookups cascade down the hierarchy: L1 → L2 → Database. 
 
+![multi-level-cache](https://github.com/ariga/entcache/raw/assets/internal/assets/multilevel.png)
+
 Entcache supports a variety of backend adapters. Below are the supported cache architectures and their features:
 
 #### Rueidis (`rueidiscache`)
