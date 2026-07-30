@@ -7,8 +7,13 @@ import (
 
 // multiLevel provides a multi-level cache implementation.
 type multiLevel struct {
-	levels []AddGetDeleter
+	levels []Cache
 }
+
+var (
+	_ Cache          = (*multiLevel)(nil)
+	_ StampedeLocker = (*multiLevel)(nil)
+)
 
 // Add adds the entry to the cache.
 func (m *multiLevel) Add(ctx context.Context, k Key, e *Entry, ttl time.Duration) error {
@@ -41,4 +46,14 @@ func (m *multiLevel) Del(ctx context.Context, k Key) error {
 		}
 	}
 	return nil
+}
+
+// LockOrWait implements StampedeLocker interface for multiLevel cache.
+func (m *multiLevel) LockOrWait(ctx context.Context, k Key) (bool, func(context.Context) (*Entry, error), func(context.Context), error) {
+	for i := range m.levels {
+		if locker, ok := m.levels[i].(StampedeLocker); ok {
+			return locker.LockOrWait(ctx, k)
+		}
+	}
+	return true, nil, nil, nil
 }

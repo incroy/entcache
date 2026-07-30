@@ -14,7 +14,6 @@ import (
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/sql"
 	"github.com/mitchellh/hashstructure/v2"
-	"golang.org/x/sync/singleflight"
 )
 
 type (
@@ -59,7 +58,6 @@ type (
 		dialect.Driver
 		*Options
 		stats Stats
-		group singleflight.Group
 	}
 )
 
@@ -106,7 +104,7 @@ func Hash(hash func(query string, args []any) (Key, error)) Option {
 }
 
 // Levels configures the Driver to work with the given cache levels.
-func Levels(levels ...AddGetDeleter) Option {
+func Levels(levels ...Cache) Option {
 	return func(o *Options) {
 		if len(levels) == 1 {
 			o.Cache = levels[0]
@@ -116,10 +114,36 @@ func Levels(levels ...AddGetDeleter) Option {
 	}
 }
 
+type contextLevelCache struct{}
+
+func (c *contextLevelCache) Get(ctx context.Context, k Key) (*Entry, error) {
+	m, ok := FromContext(ctx)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return m.Get(ctx, k)
+}
+
+func (c *contextLevelCache) Add(ctx context.Context, k Key, e *Entry, ttl time.Duration) error {
+	m, ok := FromContext(ctx)
+	if !ok {
+		return nil
+	}
+	return m.Add(ctx, k, e, ttl)
+}
+
+func (c *contextLevelCache) Del(ctx context.Context, k Key) error {
+	m, ok := FromContext(ctx)
+	if !ok {
+		return nil
+	}
+	return m.Del(ctx, k)
+}
+
 // ContextLevel configures the driver to work with context/request level cache.
 func ContextLevel() Option {
 	return func(o *Options) {
-		o.Cache = &contextLevel{}
+		o.Cache = &contextLevelCache{}
 	}
 }
 
@@ -178,7 +202,7 @@ func (d *Driver) Query(ctx context.Context, query string, args, v any) error {
 }
 
 func (d *Driver) queryWithStampedeLock(ctx context.Context, query string, args any, vr *sql.Rows, opts ctxOptions) error {
-	// If backend implements StampedeLocker (e.g. natscache or rueidiscache)
+	// If backend implements StampedeLocker
 	if locker, ok := d.Cache.(StampedeLocker); ok {
 		won, wait, release, err := locker.LockOrWait(ctx, opts.key)
 		if err == nil {
@@ -193,23 +217,6 @@ func (d *Driver) queryWithStampedeLock(ctx context.Context, query string, args a
 				// Fallback to querying DB if wait failed or key was cleared
 			} else if release != nil {
 				defer release(ctx)
-			}
-		}
-	} else {
-		// Singleflight deduplication for in-process stampede protection
-		keyStr := fmt.Sprint(opts.key)
-		res, err, _ := d.group.Do(keyStr, func() (any, error) {
-			// Fast check if another goroutine in singleflight already wrote to cache
-			if e, err := d.Cache.Get(ctx, opts.key); err == nil {
-				return e, nil
-			}
-			return nil, ErrNotFound
-		})
-		if err == nil && res != nil {
-			if e, ok := res.(*Entry); ok {
-				atomic.AddUint64(&d.stats.Hits, 1)
-				vr.ColumnScanner = &repeater{columns: e.Columns, values: e.Values}
-				return nil
 			}
 		}
 	}

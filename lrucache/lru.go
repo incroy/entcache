@@ -3,21 +3,31 @@ package lrucache
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
-	"github.com/incroy/entcache"
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/incroy/entcache"
+	"golang.org/x/sync/singleflight"
 )
 
 type (
 	// LRU provides a thread-safe LRU cache using hashicorp/golang-lru/v2.
 	LRU struct {
 		cache *lru.Cache[string, any]
+		group singleflight.Group
+		mu    sync.Mutex
+		waits map[string]chan struct{}
 	}
 	entry struct {
 		*entcache.Entry
 		expiry time.Time
 	}
+)
+
+var (
+	_ entcache.Cache          = (*LRU)(nil)
+	_ entcache.StampedeLocker = (*LRU)(nil)
 )
 
 // New creates a new LRU cache level.
@@ -30,7 +40,10 @@ func New(maxEntries int) (*LRU, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &LRU{cache: c}, nil
+	return &LRU{
+		cache: c,
+		waits: make(map[string]chan struct{}),
+	}, nil
 }
 
 // MustNew creates a new LRU cache level or panics on error.
@@ -43,7 +56,7 @@ func MustNew(maxEntries int) *LRU {
 }
 
 // Add adds the entry to the cache.
-func (l *LRU) Add(_ context.Context, k entcache.Key, e *entcache.Entry, ttl time.Duration) error {
+func (l *LRU) Add(ctx context.Context, k entcache.Key, e *entcache.Entry, ttl time.Duration) error {
 	key := fmt.Sprint(k)
 	if key == "" {
 		return nil
@@ -61,11 +74,17 @@ func (l *LRU) Add(_ context.Context, k entcache.Key, e *entcache.Entry, ttl time
 	} else {
 		l.cache.Add(key, &entry{Entry: ne, expiry: time.Now().Add(ttl)})
 	}
+	l.mu.Lock()
+	if ch, ok := l.waits[key]; ok {
+		close(ch)
+		delete(l.waits, key)
+	}
+	l.mu.Unlock()
 	return nil
 }
 
 // Get gets an entry from the cache.
-func (l *LRU) Get(_ context.Context, k entcache.Key) (*entcache.Entry, error) {
+func (l *LRU) Get(ctx context.Context, k entcache.Key) (*entcache.Entry, error) {
 	key := fmt.Sprint(k)
 	if key == "" {
 		return nil, entcache.ErrNotFound
@@ -89,11 +108,43 @@ func (l *LRU) Get(_ context.Context, k entcache.Key) (*entcache.Entry, error) {
 }
 
 // Del deletes an entry from the cache.
-func (l *LRU) Del(_ context.Context, k entcache.Key) error {
+func (l *LRU) Del(ctx context.Context, k entcache.Key) error {
 	key := fmt.Sprint(k)
 	if key == "" {
 		return nil
 	}
 	l.cache.Remove(key)
 	return nil
+}
+
+// LockOrWait implements StampedeLocker interface using singleflight and wait channels.
+func (l *LRU) LockOrWait(ctx context.Context, k entcache.Key) (bool, func(context.Context) (*entcache.Entry, error), func(context.Context), error) {
+	key := fmt.Sprint(k)
+	l.mu.Lock()
+	if ch, ok := l.waits[key]; ok {
+		l.mu.Unlock()
+		wait := func(c context.Context) (*entcache.Entry, error) {
+			select {
+			case <-c.Done():
+				return nil, c.Err()
+			case <-ch:
+				return l.Get(c, k)
+			}
+		}
+		return false, wait, nil, nil
+	}
+
+	ch := make(chan struct{})
+	l.waits[key] = ch
+	l.mu.Unlock()
+
+	release := func(_ context.Context) {
+		l.mu.Lock()
+		if ch, ok := l.waits[key]; ok {
+			close(ch)
+			delete(l.waits, key)
+		}
+		l.mu.Unlock()
+	}
+	return true, nil, release, nil
 }

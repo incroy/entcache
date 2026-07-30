@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,13 +12,19 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-const placeholderSuffix = ":lock"
+const placeholderSuffix = "_lock"
 
 // NatsKV provides a remote cache backed by NATS JetStream KeyValue
 // with built-in distributed stampede locking and real-time Watch invalidations.
 type NatsKV struct {
 	kv jetstream.KeyValue
 }
+
+var (
+	_ entcache.Cache          = (*NatsKV)(nil)
+	_ entcache.StampedeLocker = (*NatsKV)(nil)
+	_ entcache.Invalidator    = (*NatsKV)(nil)
+)
 
 // New returns a new NATS JetStream KeyValue cache level.
 func New(kv jetstream.KeyValue) *NatsKV {
@@ -154,7 +161,10 @@ func (n *NatsKV) WatchInvalidations(ctx context.Context, onInvalidate func(key e
 				if update != nil {
 					op := update.Operation()
 					if op == jetstream.KeyValueDelete || op == jetstream.KeyValuePurge {
-						onInvalidate(update.Key())
+						k := update.Key()
+						if !strings.HasSuffix(k, placeholderSuffix) {
+							onInvalidate(k)
+						}
 					}
 				}
 			}
@@ -164,5 +174,6 @@ func (n *NatsKV) WatchInvalidations(ctx context.Context, onInvalidate func(key e
 }
 
 func sanitizeKey(k entcache.Key) string {
-	return fmt.Sprint(k)
+	s := fmt.Sprint(k)
+	return strings.ReplaceAll(s, ":", "_")
 }

@@ -3,10 +3,12 @@ package entcache_test
 import (
 	"context"
 	"database/sql/driver"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/incroy/entcache"
+	"github.com/incroy/entcache/contextcache"
 	"github.com/incroy/entcache/lrucache"
 	"github.com/incroy/entcache/natscache"
 	"github.com/incroy/entcache/rediscache"
@@ -31,7 +33,7 @@ func TestDriver_ContextLevel(t *testing.T) {
 	drv := sql.OpenDB(dialect.MySQL, db)
 
 	t.Run("One", func(t *testing.T) {
-		drv := entcache.NewDriver(drv, entcache.ContextLevel())
+		drv := entcache.NewDriver(drv, entcache.Levels(contextcache.New()))
 		mock.ExpectQuery("SELECT id FROM users").
 			WillReturnRows(
 				sqlmock.NewRows([]string{"id"}).
@@ -39,7 +41,7 @@ func TestDriver_ContextLevel(t *testing.T) {
 					AddRow(2).
 					AddRow(3),
 			)
-		ctx := entcache.NewContext(context.Background())
+		ctx := contextcache.NewContext(context.Background())
 		expectQuery(ctx, t, drv, "SELECT id FROM users", []interface{}{int64(1), int64(2), int64(3)})
 		expectQuery(ctx, t, drv, "SELECT id FROM users", []interface{}{int64(1), int64(2), int64(3)})
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -48,12 +50,12 @@ func TestDriver_ContextLevel(t *testing.T) {
 	})
 
 	t.Run("Multi", func(t *testing.T) {
-		drv := entcache.NewDriver(drv, entcache.ContextLevel())
+		drv := entcache.NewDriver(drv, entcache.Levels(contextcache.New()))
 		mock.ExpectQuery("SELECT name FROM users").
 			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
-		ctx1 := entcache.NewContext(context.Background())
+		ctx1 := contextcache.NewContext(context.Background())
 		expectQuery(ctx1, t, drv, "SELECT name FROM users", []interface{}{"a8m"})
-		ctx2 := entcache.NewContext(context.Background())
+		ctx2 := contextcache.NewContext(context.Background())
 		mock.ExpectQuery("SELECT name FROM users").
 			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
 		expectQuery(ctx2, t, drv, "SELECT name FROM users", []interface{}{"a8m"})
@@ -63,12 +65,12 @@ func TestDriver_ContextLevel(t *testing.T) {
 	})
 
 	t.Run("TTL", func(t *testing.T) {
-		drv := entcache.NewDriver(drv, entcache.ContextLevel(), entcache.TTL(-1))
+		drv := entcache.NewDriver(drv, entcache.Levels(contextcache.New()), entcache.TTL(-1))
 		mock.ExpectQuery("SELECT name FROM users").
 			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
 		mock.ExpectQuery("SELECT name FROM users").
 			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
-		ctx := entcache.NewContext(context.Background())
+		ctx := contextcache.NewContext(context.Background())
 		expectQuery(ctx, t, drv, "SELECT name FROM users", []interface{}{"a8m"})
 		expectQuery(ctx, t, drv, "SELECT name FROM users", []interface{}{"a8m"})
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -128,7 +130,6 @@ func TestDriver_Levels(t *testing.T) {
 			drv        = entcache.NewDriver(
 				drv,
 				entcache.Levels(
-					lrucache.MustNew(10),
 					rediscache.New(rdb),
 				),
 				entcache.Hash(func(string, []interface{}) (entcache.Key, error) {
@@ -139,8 +140,8 @@ func TestDriver_Levels(t *testing.T) {
 		mock.ExpectQuery("SELECT active FROM users").
 			WillReturnRows(sqlmock.NewRows([]string{"active"}).AddRow(true).AddRow(false))
 		rmock.ExpectGet("1").RedisNil()
-		buf, _ := entcache.Entry{Values: [][]driver.Value{{true}, {false}}}.MarshalBinary()
-		rmock.ExpectSet("1", buf, 0).RedisNil()
+		buf, _ := entcache.Entry{Columns: []string{"active"}, Values: [][]driver.Value{{true}, {false}}}.MarshalBinary()
+		rmock.ExpectSet("1", buf, 0).SetVal("OK")
 		expectQuery(context.Background(), t, drv, "SELECT active FROM users", []interface{}{true, false})
 		rmock.ExpectGet("1").SetVal(string(buf))
 		expectQuery(context.Background(), t, drv, "SELECT active FROM users", []interface{}{true, false})
@@ -162,7 +163,7 @@ func TestDriver_ContextOptions(t *testing.T) {
 	drv := sql.OpenDB(dialect.MySQL, db)
 
 	t.Run("Skip", func(t *testing.T) {
-		drv := entcache.NewDriver(drv)
+		drv := entcache.NewDriver(drv, entcache.Levels(lrucache.MustNew(100)))
 		mock.ExpectQuery("SELECT name FROM users").
 			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
 		ctx := context.Background()
@@ -179,7 +180,7 @@ func TestDriver_ContextOptions(t *testing.T) {
 	})
 
 	t.Run("Evict", func(t *testing.T) {
-		drv := entcache.NewDriver(drv)
+		drv := entcache.NewDriver(drv, entcache.Levels(lrucache.MustNew(100)))
 		mock.ExpectQuery("SELECT name FROM users").
 			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
 		ctx := context.Background()
@@ -198,7 +199,7 @@ func TestDriver_ContextOptions(t *testing.T) {
 	})
 
 	t.Run("WithTTL", func(t *testing.T) {
-		drv := entcache.NewDriver(drv)
+		drv := entcache.NewDriver(drv, entcache.Levels(lrucache.MustNew(100)))
 		mock.ExpectQuery("SELECT name FROM users").
 			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
 		ttlCtx := entcache.WithTTL(context.Background(), -1)
@@ -212,7 +213,7 @@ func TestDriver_ContextOptions(t *testing.T) {
 	})
 
 	t.Run("WithKey", func(t *testing.T) {
-		drv := entcache.NewDriver(drv)
+		drv := entcache.NewDriver(drv, entcache.Levels(lrucache.MustNew(100)))
 		mock.ExpectQuery("SELECT name FROM users").
 			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
 		ctx := context.Background()
@@ -266,11 +267,24 @@ func expectQuery(ctx context.Context, t *testing.T, drv dialect.Driver, query st
 	}
 	var dest []interface{}
 	for rows.Next() {
-		var v interface{}
-		if err := rows.Scan(&v); err != nil {
-			t.Fatal("unexpected Rows.Scan failure:", err)
+		cols, err := rows.Columns()
+		if err != nil || len(cols) <= 1 {
+			var v interface{}
+			if err := rows.Scan(&v); err != nil {
+				t.Fatal("unexpected Rows.Scan failure:", err)
+			}
+			dest = append(dest, v)
+		} else {
+			vals := make([]interface{}, len(cols))
+			ptrs := make([]interface{}, len(cols))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				t.Fatal("unexpected Rows.Scan failure:", err)
+			}
+			dest = append(dest, vals...)
 		}
-		dest = append(dest, v)
 	}
 	if len(dest) != len(args) {
 		t.Fatalf("mismatch rows length: %d != %d", len(dest), len(args))
@@ -443,5 +457,44 @@ func TestDriver_RueidisCache(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDriver_StampedeLock(t *testing.T) {
+	db, sqlMock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Expect exactly 1 query to database, because stampede protection prevents duplicate DB calls
+	sqlMock.ExpectQuery("SELECT name FROM users").
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("alice"))
+
+	drv := entcache.NewDriver(
+		sql.OpenDB(dialect.Postgres, db),
+		entcache.Levels(lrucache.MustNew(100)),
+		entcache.TTL(time.Minute),
+	)
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		expectQuery(ctx, t, drv, "SELECT name FROM users", []interface{}{"alice"})
+	}()
+
+	go func() {
+		defer wg.Done()
+		time.Sleep(10 * time.Millisecond)
+		expectQuery(ctx, t, drv, "SELECT name FROM users", []interface{}{"alice"})
+	}()
+
+	wg.Wait()
+
+	if err := sqlMock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 
 

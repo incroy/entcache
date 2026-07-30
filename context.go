@@ -14,6 +14,8 @@ type memoryCache struct {
 	items map[string]*Entry
 }
 
+var _ Cache = (*memoryCache)(nil)
+
 func newMemoryCache() *memoryCache {
 	return &memoryCache{items: make(map[string]*Entry)}
 }
@@ -45,23 +47,14 @@ func (m *memoryCache) Del(_ context.Context, k Key) error {
 	return nil
 }
 
-// NewContext returns a new Context that carries a cache.
-func NewContext(ctx context.Context, levels ...AddGetDeleter) context.Context {
-	var cache AddGetDeleter
-	switch len(levels) {
-	case 0:
-		cache = newMemoryCache()
-	case 1:
-		cache = levels[0]
-	default:
-		cache = &multiLevel{levels: levels}
-	}
-	return context.WithValue(ctx, ctxKey{}, cache)
+// NewContext returns a new Context that carries a request-scoped memory cache.
+func NewContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ctxKey{}, newMemoryCache())
 }
 
 // FromContext returns the cache value stored in ctx, if any.
-func FromContext(ctx context.Context) (AddGetDeleter, bool) {
-	c, ok := ctx.Value(ctxKey{}).(AddGetDeleter)
+func FromContext(ctx context.Context) (Cache, bool) {
+	c, ok := ctx.Value(ctxKey{}).(Cache)
 	return c, ok
 }
 

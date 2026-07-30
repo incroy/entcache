@@ -22,6 +22,11 @@ type Rueidis struct {
 	waits map[string]chan struct{}
 }
 
+var (
+	_ entcache.Cache          = (*Rueidis)(nil)
+	_ entcache.StampedeLocker = (*Rueidis)(nil)
+)
+
 // New returns a new Rueidis cache level.
 func New(c rueidis.Client) *Rueidis {
 	return &Rueidis{

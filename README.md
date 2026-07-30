@@ -5,7 +5,7 @@
 
 A production-ready, modular cache driver for [ent](https://github.com/ent/ent) with built-in distributed stampede protection, real-time invalidation event streaming, and modular sub-packages:
 
-- **Modular Storage Backends** — clean sub-packages for `lrucache` (Hashicorp LRU v2), `natscache` (NATS JetStream KV), `rediscache` (go-redis), and `rueidiscache` (Rueidis with native RESP3 client-side caching). Zero bloated dependencies in core `entcache`.
+- **Modular Storage Backends** — clean sub-packages for `contextcache` (per-request in-memory cache with stampede protection), `lrucache` (Hashicorp LRU v2), `natscache` (NATS JetStream KV), `rediscache` (go-redis), and `rueidiscache` (Rueidis with native RESP3 client-side caching). Zero bloated dependencies in core `entcache`.
 - **Automatic Stampede Protection** — built-in distributed locking (`KV.Create` placeholder lock + `Watch` waiting) for NATS, channel lock waiting for Rueidis, and singleflight deduplication for LRU/Redis.
 - **Native Client-Side Caching** — `rueidiscache` leverages Rueidis RESP3 client-side caching out of the box (in-memory client cache with server-driven invalidation) with no extra LRU required.
 - **Context-level** — per-request cache attached to a `context.Context` (e.g. HTTP request or GraphQL resolve) that eliminates duplicate queries within a single request.
@@ -24,6 +24,7 @@ Install core `entcache` along with your preferred cache backend sub-package:
 go get github.com/incroy/entcache
 
 # Optional modular backends
+go get github.com/incroy/entcache/contextcache # Request-scoped in-memory cache
 go get github.com/incroy/entcache/lrucache      # Hashicorp LRU v2
 go get github.com/incroy/entcache/natscache     # NATS JetStream KV
 go get github.com/incroy/entcache/rediscache    # go-redis/v9
@@ -211,6 +212,19 @@ rdb := redis.NewClient(&redis.Options{Addr: ":6379"})
 drv := entcache.NewDriver(sqlDrv,
     entcache.TTL(time.Minute),
     entcache.Levels(rediscache.New(rdb)),
+)
+```
+
+### 5. Context Cache (`contextcache`)
+
+Per-request memory cache (`github.com/incroy/entcache/contextcache`) with built-in channel lock waiting for stampede protection across goroutines handling a request context.
+
+```go
+import "github.com/incroy/entcache/contextcache"
+
+drv := entcache.NewDriver(sqlDrv,
+    entcache.TTL(time.Minute),
+    entcache.Levels(contextcache.New()),
 )
 ```
 
@@ -422,10 +436,22 @@ Full documentation is available at [pkg.go.dev/github.com/incroy/entcache](https
 | `ContextLevel()` | Use context-scoped caching |
 | `WithChangeSet(cs)` | Enable mutation-aware invalidation |
 
+### Context Options (Per-Query Control)
+
+| Function | Description |
+|---|---|
+| `Skip(ctx)` | Skip cache for a query |
+| `Evict(ctx)` | Skip and invalidate cache entry for a query |
+| `WithKey(ctx, key)` | Explicitly set cache key for a query |
+| `WithTTL(ctx, ttl)` | Custom TTL for a query |
+| `WithEntryKey(ctx, typ, id)` | Structured entity key (e.g. `"User:42"`) for Get-by-ID queries & ChangeSet invalidation |
+| `SkipNotFound(ctx)` | Prevent caching when query result contains 0 rows |
+
 ### Cache Backends
 
 | Sub-Package | Package Name | Constructor | Features |
 |---|---|---|---|
+| `github.com/incroy/entcache/contextcache` | `contextcache` | `contextcache.New()` | Per-request cache with channel stampede locking |
 | `github.com/incroy/entcache/lrucache` | `lrucache` | `lrucache.New(size)` | Hashicorp LRU v2 in-process cache |
 | `github.com/incroy/entcache/natscache` | `natscache` | `natscache.New(kv)` | NATS KV Create stampede lock & Watch invalidation |
 | `github.com/incroy/entcache/rueidiscache` | `rueidiscache` | `rueidiscache.New(client)` | Native RESP3 Client-Side Caching & lock channels |
