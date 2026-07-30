@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "test-driven-development": {
+      "source": "sickn33/antigravity-awesome-skills",
+      "sourceType": "github",
+      "skillPath": "skills/test-driven-development/SKILL.md",
+      "computedHash": "2b01594a325a084e8cc18bff11a3ee72d8cf53f76f219e94e30c64d083dceff3"
+    }
+  }
+}

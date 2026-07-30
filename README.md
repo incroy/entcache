@@ -1,19 +1,22 @@
-# entcache
+# entcache - Distributed Cache Driver for Ent ORM
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/incroy/entcache.svg)](https://pkg.go.dev/github.com/incroy/entcache)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-A production-ready, modular cache driver for [ent](https://github.com/ent/ent) with built-in distributed stampede protection, real-time invalidation event streaming, and modular sub-packages:
+**entcache** is a production-ready, modular **cache driver for ent**, the popular **Go ORM framework**. It drastically reduces database load by intercepting queries, caching results, and offering advanced distributed caching techniques like **Cache Stampede Protection (Dogpile Effect prevention)**, **Native RESP3 Client-Side Caching**, and **Mutation-Aware Cache Invalidation**.
 
-- **Modular Storage Backends** — clean sub-packages for `contextcache` (per-request in-memory cache with stampede protection), `lrucache` (Hashicorp LRU v2), `natscache` (NATS JetStream KV), `rediscache` (go-redis), and `rueidiscache` (Rueidis with native RESP3 client-side caching). Zero bloated dependencies in core `entcache`.
-- **Automatic Stampede Protection** — built-in distributed locking (`KV.Create` placeholder lock + `Watch` waiting) for NATS, channel lock waiting for Rueidis, and singleflight deduplication for LRU/Redis.
-- **Native Client-Side Caching** — `rueidiscache` leverages Rueidis RESP3 client-side caching out of the box (in-memory client cache with server-driven invalidation) with no extra LRU required.
-- **Context-level** — per-request cache attached to a `context.Context` (e.g. HTTP request or GraphQL resolve) that eliminates duplicate queries within a single request.
-- **Driver-level** — process-level cache embedded in the `ent.Client` and shared across all goroutines.
-- **Multi-level** — hierarchical cache structure (e.g. L1 LRU memory cache + L2 remote Redis/NATS store) for optimal latency and durability.
-- **Mutation-aware invalidation** — ent hooks automatically invalidate stale cache entries when entity mutations (create, update, delete) occur.
+Whether you're building a GraphQL server needing a **Context caching (GraphQL DataLoader pattern)** or a massive microservices architecture demanding **Multi-level caching** and **Distributed caching** with **Redis (go-redis)**, **Rueidis**, or **NATS JetStream KV**, `entcache` has you covered.
 
-Compatible with standard `database/sql` drivers as well as native drivers like [entpgx](https://github.com/incroy/entpgx).
+## Core Features
+
+- **Distributed Cache Stampede Protection (Dogpile Effect prevention)**: When multiple concurrent requests experience a cache miss for the same key, exactly **one** request becomes the "winner" and fetches the data from the database. The remaining "waiters" block seamlessly.
+- **Deadlock-Free Background Heartbeats**: The "winner" maintains a background heartbeat (`keepalive`) while the DB query executes. If the winner crashes, the lock natively expires, and a waiter automatically takes over.
+- **Real-Time Cross-Node Cache Invalidation**: Waiters do not poll blindly. They utilize native Push/Watch capabilities (like NATS `Watch`) to receive an immediate event when the winner finishes, allowing them to resume instantaneously.
+- **Native RESP3 Client-Side Caching**: `rueidiscache` leverages **Rueidis** RESP3 **Client-Side Caching** out of the box (in-memory client cache with server-driven invalidation) with no extra LRU required.
+- **Accurate Payload TTLs**: Uses a strict 2-key architecture to isolate the stampede lock from the actual payload data, ensuring that caching entries retain exactly the user-defined TTL.
+- **Multi-Level Caching**: Hierarchical cache structure (e.g. L1 LRU memory cache + L2 remote **Redis** or **NATS JetStream KV** store) for optimal latency and durability in **Go ORM caching**.
+- **Mutation-Aware Cache Invalidation**: ent hooks automatically invalidate stale cache entries when entity mutations (create, update, delete) occur.
+- **Zero Bloat Modular Cache Driver**: Clean modular sub-packages for `lrucache`, `natscache`, `rediscache`, and `rueidiscache`.
 
 ## Installation
 
@@ -31,125 +34,105 @@ go get github.com/incroy/entcache/rediscache    # go-redis/v9
 go get github.com/incroy/entcache/rueidiscache  # Rueidis (Native RESP3 Client-Side Caching)
 ```
 
-## Quick Start
-
-### With `database/sql` Driver & Hashicorp LRU
-
-```go
-import (
-    "github.com/incroy/entcache"
-    "github.com/incroy/entcache/lrucache"
-)
-
-// Open the database connection.
-db, err := sql.Open(dialect.Postgres, "postgres://localhost:5432/mydb?sslmode=disable")
-if err != nil {
-    log.Fatal("opening database", err)
-}
-
-// Wrap the sql.Driver with entcache.Driver.
-drv := entcache.NewDriver(
-    sql.OpenDB(dialect.Postgres, db),
-    entcache.TTL(time.Minute),
-    entcache.Levels(lrucache.MustNew(1000)),
-)
-
-// Create an ent.Client.
-client := ent.NewClient(ent.Driver(drv))
-
-// Skip the cache during schema migration.
-if err := client.Schema.Create(entcache.Skip(ctx)); err != nil {
-    log.Fatal("running schema migration", err)
-}
-
-// First call hits the database.
-u, err := client.User.Get(ctx, id)
-
-// Second call is served from cache.
-u, err = client.User.Get(ctx, id)
-```
-
-### With `entpgx` (Native pgx Driver)
-
-[entpgx](https://github.com/incroy/entpgx) provides a native `pgxpool.Pool`-based `dialect.Driver` that bypasses `database/sql` entirely. `entcache` wraps it seamlessly:
-
-```go
-import (
-    "github.com/incroy/entpgx"
-    "github.com/jackc/pgx/v5/pgxpool"
-    "github.com/incroy/entcache"
-    "github.com/incroy/entcache/lrucache"
-)
-
-// Create a pgxpool.Pool.
-pool, err := pgxpool.New(ctx, "postgres://localhost:5432/mydb?sslmode=disable")
-if err != nil {
-    log.Fatal(err)
-}
-
-// Create the entpgx driver.
-pgxDrv := entpgx.NewDriver(pool)
-
-// Wrap with entcache.
-drv := entcache.NewDriver(
-    pgxDrv,
-    entcache.TTL(time.Minute),
-    entcache.Levels(lrucache.MustNew(1024)),
-)
-
-// Create an ent.Client.
-client := ent.NewClient(ent.Driver(drv))
-
-// Skip cache during migrations.
-if err := client.Schema.Create(entcache.Skip(ctx)); err != nil {
-    log.Fatal(err)
-}
-
-// Queries are cached transparently.
-u, err := client.User.Get(ctx, id)
-```
-
 ## High Level Design
 
 On a high level, `entcache.Driver` decorates the `Query` method of the given driver, and for each call, generates a cache key (i.e. hash) from its arguments (statement and query parameters). After the query is executed, the driver records the raw values of the returned rows (`sql.Rows`) and stores them in the cache store with the generated cache key. Subsequent identical queries replay the recorded rows directly from cache without hitting the database, provided the entry has not expired or been evicted.
 
-```
-+------------+       1. Query(SQL, Args)       +------------------+       2. Get(Key)       +-------------+
-| ent.Client | ------------------------------> | entcache.Driver  | ----------------------> | Cache Store |
-+------------+                                 +------------------+                         +-------------+
-                                                         |                                         |
-                                                         | (Cache Miss)                            | (Hit)
-                                                         v                                         v
-                                               +------------------+                       +-----------------+
-                                               | Wrapped Driver   |                       | Replay Cached   |
-                                               | (SQL Database)   |                       | Rows            |
-                                               +------------------+                       +-----------------+
-```
+`entcache` provides three main caching architectures to optimize your application:
 
-The package provides a rich set of options to configure entry TTLs, control hash functions, set up multi-level cache hierarchies, invalidate/skip entries on-demand, and perform automatic mutation-aware invalidation.
+### 1. Context-Level Cache
 
-## Modular Cache Backends
+Scoped to a single `context.Context` (e.g. `*http.Request`). The context carries an in-memory cache to eliminate duplicate database queries executed during the same request lifecycle.
 
-### 1. Hashicorp LRU (`lrucache`)
-
-Thread-safe in-process LRU cache powered by `github.com/hashicorp/golang-lru/v2`. Fast, zero-network-overhead.
+![context-level-cache](https://github.com/ariga/entcache/raw/assets/internal/assets/ctxlevel.png)
 
 ```go
-import "github.com/incroy/entcache/lrucache"
+drv := entcache.NewDriver(sqlDrv, entcache.ContextLevel())
+client := ent.NewClient(ent.Driver(drv))
 
-drv := entcache.NewDriver(sqlDrv,
+// Wrap the request context
+ctx = entcache.NewContext(ctx)
+```
+
+#### Solving the GraphQL N+1 Problem (DataLoader Pattern)
+
+When building a GraphQL server, you often face the classic **N+1 Problem**. A naive resolver executes 1 query to fetch $N$ users, $N$ queries to fetch their todos, and another $N$ queries to fetch the owners of those todos.
+
+```graphql
+query($ids: [ID!]!) {
+    nodes(ids: $ids) {
+        ... on User {
+            id
+            name
+            todos {
+                id
+                owner {
+                    id
+                    name
+                }
+            }
+        }
+    }
+}
+```
+
+The Ent ORM optimizes this by batching execution into 3 queries. With `entcache`'s **Context caching (GraphQL DataLoader pattern)**, the number of queries is further reduced from 3 to **2**, because fetching users (Query 1) and fetching todo owners (Query 3) execute identical SQL statements. Query 3 is served directly from the context cache in-memory!
+
+```go
+srv.AroundResponses(func(ctx context.Context, next graphql.ResponseHandler) *graphql.Response {
+    if op := graphql.GetOperationContext(ctx).Operation; op != nil && op.Operation == ast.Query {
+        // Initialize the Context Cache for this specific GraphQL Request
+        ctx = entcache.NewContext(ctx)
+    }
+    return next(ctx)
+})
+```
+
+### 2. Driver-Level Cache
+
+Embedded directly in `ent.Client` via `entcache.NewDriver`. The driver-level cache is process-scoped and shared across all goroutines in the application process.
+
+![driver-level-cache](https://github.com/ariga/entcache/raw/assets/internal/assets/drvlevel.png)
+
+```go
+drv := entcache.NewDriver(
+    sqlDrv,
     entcache.TTL(time.Minute),
     entcache.Levels(lrucache.MustNew(1000)),
 )
+client := ent.NewClient(ent.Driver(drv))
 ```
 
-### 2. NATS JetStream KV (`natscache`)
+### 3. Multi-Level Cache
+
+A cache hierarchy structures cache stores by access speed and capacity (e.g. L1 in-memory LRU + L2 remote NATS KV/Redis). Lookups cascade down the hierarchy: L1 → L2 → Database. This is ideal for distributed microservices.
+
+![multi-level-cache](https://github.com/ariga/entcache/raw/assets/internal/assets/multilevel.png)
+
+```go
+drv := entcache.NewDriver(
+    sqlDrv,
+    entcache.TTL(time.Minute),
+    entcache.Levels(
+        lrucache.MustNew(256),  // Level 1: fast in-process memory
+        natscache.New(kv),      // Level 2: durable NATS JetStream KV
+    ),
+)
+client := ent.NewClient(ent.Driver(drv))
+```
+
+---
+
+## Modular Cache Backends
+
+### NATS JetStream KV (`natscache`)
 
 Distributed cache backed by NATS JetStream KeyValue (`github.com/incroy/entcache/natscache`).
 
 **Out-of-the-Box Features**:
-- **Distributed Stampede Protection**: On a cache miss, the winner acquires a `KV.Create` placeholder lock and executes the DB query. Concurrent callers on other nodes automatically wait via `KV.Watch` until the value is populated.
-- **Real-Time Cross-Node Invalidation**: Listens to NATS `Watch` events (`KeyValueDelete` / `KeyValuePurge`) and automatically evicts stale keys across all application nodes.
+- **Distributed Caching**: Stores cache data directly inside NATS JetStream KV, providing a durable, scalable, clustered backend.
+- **Distributed Cache Stampede Protection**: Waiters block via native `Watch` events (`KeyValueDelete` / `KeyValuePurge`) allowing real-time cross-node invalidation and resumption.
+- **Fault-Tolerant Heartbeats**: Background keepalives prevent deadlocks and ensure accurate TTLs using a 2-key architecture.
 
 ```go
 import (
@@ -159,9 +142,12 @@ import (
 
 nc, _ := nats.Connect(nats.DefaultURL)
 js, _ := jetstream.New(nc)
+
+// Important: LimitMarkerTTL MUST be enabled for the lock's per-key TTL to work.
 kv, _ := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-    Bucket: "entcache",
-    MaxAge: 10 * time.Minute,
+    Bucket:         "entcache",
+    TTL:            10 * time.Minute,
+    LimitMarkerTTL: time.Second, // Required for stampede protection heartbeats
 })
 
 drv := entcache.NewDriver(sqlDrv,
@@ -170,7 +156,7 @@ drv := entcache.NewDriver(sqlDrv,
 )
 ```
 
-### 3. Rueidis (`rueidiscache`)
+### Rueidis (`rueidiscache`)
 
 High-performance Redis cache powered by Rueidis (`github.com/incroy/entcache/rueidiscache`).
 
@@ -198,7 +184,7 @@ drv := entcache.NewDriver(sqlDrv,
 )
 ```
 
-### 4. Redis (`rediscache`)
+### Redis (`rediscache`)
 
 Standard remote cache backed by `github.com/redis/go-redis/v9` (`github.com/incroy/entcache/rediscache`).
 
@@ -215,116 +201,18 @@ drv := entcache.NewDriver(sqlDrv,
 )
 ```
 
-### 5. Context Cache (`contextcache`)
+### Hashicorp LRU (`lrucache`)
 
-Per-request memory cache (`github.com/incroy/entcache/contextcache`) with built-in channel lock waiting for stampede protection across goroutines handling a request context.
+Thread-safe in-process LRU cache powered by `github.com/hashicorp/golang-lru/v2`. Fast, zero-network-overhead.
 
 ```go
-import "github.com/incroy/entcache/contextcache"
+import "github.com/incroy/entcache/lrucache"
 
 drv := entcache.NewDriver(sqlDrv,
     entcache.TTL(time.Minute),
-    entcache.Levels(contextcache.New()),
-)
-```
-
----
-
-## Caching Levels
-
-`entcache` provides several builtin cache levels:
-
-1. **`context.Context` Cache** — Attached to a request (e.g. HTTP request or GraphQL resolve). Used to eliminate duplicate database queries executed during the same request lifecycle.
-2. **Driver-Level Cache** — Embedded in `ent.Client`. Shared across all goroutines in the application process.
-3. **Remote-Level Cache** — Remote cache (NATS KV, Rueidis, Redis) providing persistence and sharing cache entries across multiple service replicas.
-4. **Multi-Level Cache** — Hierarchical cache structure combining fast in-memory LRU caching with remote persistent backends.
-
----
-
-### Context-Level Cache
-
-Scoped to a single `context.Context` (e.g. `*http.Request`). The context carries an in-memory cache to eliminate duplicate database queries executed during the same request lifecycle.
-
-```graphql
-query($ids: [ID!]!) {
-    nodes(ids: $ids) {
-        ... on User {
-            id
-            name
-            todos {
-                id
-                owner {
-                    id
-                    name
-                }
-            }
-        }
-    }
-}
-```
-
-A naive GraphQL resolver executes 1 query for fetching $N$ users, $N$ queries for fetching todos of each user, and another query for each todo item to fetch its owner (the classic [_N+1 Problem_](https://entgo.io/docs/tutorial-todo-gql-field-collection/#problem)).
-
-Ent optimizes this by batching execution into 3 queries. With `entcache`, the number of queries is further reduced from 3 to **2**, because query 1 (fetch users) and query 3 (fetch todo owners) execute identical SQL statements, allowing query 3 to be served directly from context cache.
-
-![context-level-cache](https://github.com/ariga/entcache/blob/assets/internal/assets/ctxlevel.png)
-
-#### Usage In GraphQL
-
-```go
-drv := entcache.NewDriver(sqlDrv, entcache.ContextLevel())
-client := ent.NewClient(ent.Driver(drv))
-```
-
-Wrap the request `context.Context` with `entcache.NewContext` when a GraphQL query arrives:
-
-```go
-srv.AroundResponses(func(ctx context.Context, next graphql.ResponseHandler) *graphql.Response {
-    if op := graphql.GetOperationContext(ctx).Operation; op != nil && op.Operation == ast.Query {
-        ctx = entcache.NewContext(ctx)
-    }
-    return next(ctx)
-})
-```
-
-A full runnable server example is located in [examples/ctxlevel](examples/ctxlevel).
-
----
-
-### Driver-Level Cache
-
-Embedded directly in `ent.Client` via `entcache.NewDriver`. The driver-level cache is process-scoped and shared across all goroutines in the application process.
-
-```go
-drv := entcache.NewDriver(
-    sqlDrv,
-    entcache.TTL(time.Minute),
     entcache.Levels(lrucache.MustNew(1000)),
 )
-client := ent.NewClient(ent.Driver(drv))
 ```
-
----
-
-### Multi-Level Cache
-
-A cache hierarchy structures cache stores by access speed and capacity (e.g. L1 in-memory LRU + L2 remote NATS KV/Redis). Lookups cascade down the hierarchy: L1 → L2 → Database.
-
-![multi-level-cache](https://github.com/ariga/entcache/blob/assets/internal/assets/multilevel.png)
-
-```go
-drv := entcache.NewDriver(
-    sqlDrv,
-    entcache.TTL(time.Minute),
-    entcache.Levels(
-        lrucache.MustNew(256),  // Level 1: fast in-process memory
-        natscache.New(kv),      // Level 2: durable NATS JetStream KV
-    ),
-)
-client := ent.NewClient(ent.Driver(drv))
-```
-
-A full runnable server example is located in [examples/multilevel](examples/multilevel).
 
 ---
 
@@ -359,6 +247,8 @@ u, _ := client.User.Get(entcache.WithEntryKey(ctx, "User", 42), 42)
 ---
 
 ## Full Production Example (entpgx + NATS KV + Mutation Hook)
+
+[entpgx](https://github.com/incroy/entpgx) provides a native `pgxpool.Pool`-based `dialect.Driver` that bypasses `database/sql` entirely. `entcache` wraps it seamlessly:
 
 ```go
 package main
@@ -397,9 +287,12 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
+    
+    // Important: LimitMarkerTTL MUST be enabled for the lock's per-key TTL to work.
     kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-        Bucket: "entcache",
-        MaxAge: 10 * time.Minute,
+        Bucket:         "entcache",
+        TTL:            10 * time.Minute,
+        LimitMarkerTTL: time.Second, // Required for stampede protection heartbeats
     })
     if err != nil {
         log.Fatal(err)

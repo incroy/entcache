@@ -88,6 +88,9 @@ func (e *Entry) UnmarshalBinary(buf []byte) error {
 // ErrNotFound is returned by Get when an Entry does not exist in the cache.
 var ErrNotFound = errors.New("entcache: entry was not found")
 
+// ErrRetryLocker is a sentinel error used to trigger a stampede lock retry loop.
+var ErrRetryLocker = errors.New("entcache: retry locker")
+
 // NewEntryKey constructs a structured cache key from an entity type name and ID.
 // This produces keys like "User:42" that enable precise invalidation via ChangeSet.
 func NewEntryKey(typ string, id any) Key {

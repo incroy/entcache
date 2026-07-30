@@ -202,13 +202,18 @@ func (d *Driver) Query(ctx context.Context, query string, args, v any) error {
 }
 
 func (d *Driver) queryWithStampedeLock(ctx context.Context, query string, args any, vr *sql.Rows, opts ctxOptions) error {
+	var releaseFunc func(context.Context)
 	// If backend implements StampedeLocker
 	if locker, ok := d.Cache.(StampedeLocker); ok {
+	retry_lock:
 		won, wait, release, err := locker.LockOrWait(ctx, opts.key)
 		if err == nil {
 			if !won {
 				// Another node/caller is loading — block on wait() until populated
 				e, err := wait(ctx)
+				if errors.Is(err, ErrRetryLocker) {
+					goto retry_lock
+				}
 				if err == nil && e != nil {
 					atomic.AddUint64(&d.stats.Hits, 1)
 					vr.ColumnScanner = &repeater{columns: e.Columns, values: e.Values}
@@ -216,18 +221,24 @@ func (d *Driver) queryWithStampedeLock(ctx context.Context, query string, args a
 				}
 				// Fallback to querying DB if wait failed or key was cleared
 			} else if release != nil {
-				defer release(ctx)
+				releaseFunc = release
 			}
 		}
 	}
 
 	if err := d.Driver.Query(ctx, query, args, vr); err != nil {
+		if releaseFunc != nil {
+			releaseFunc(context.Background())
+		}
 		return err
 	}
 	vr.ColumnScanner = &recorder{
 		ColumnScanner: vr.ColumnScanner,
 		skipNotFound:  opts.skipNotFound,
 		onClose: func(columns []string, values [][]driver.Value) {
+			if releaseFunc != nil {
+				defer releaseFunc(context.Background())
+			}
 			err := d.Cache.Add(ctx, opts.key, &Entry{Columns: columns, Values: values}, opts.ttl)
 			if err != nil && d.Log != nil {
 				atomic.AddUint64(&d.stats.Errors, 1)
