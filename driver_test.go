@@ -3,16 +3,20 @@ package entcache_test
 import (
 	"context"
 	"database/sql/driver"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	entSql "entgo.io/ent/dialect/sql"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/incroy/entcache"
 	"github.com/incroy/entcache/contextcache"
 	"github.com/incroy/entcache/lrucache"
 	"github.com/incroy/entcache/natscache"
 	"github.com/incroy/entcache/rediscache"
 	"github.com/incroy/entcache/rueidiscache"
+	"github.com/redis/rueidis"
 
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/sql"
@@ -21,8 +25,6 @@ import (
 	natsserver "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-	"github.com/redis/rueidis/mock"
-	"go.uber.org/mock/gomock"
 )
 
 func TestDriver_ContextLevel(t *testing.T) {
@@ -421,44 +423,6 @@ func TestDriver_NatsCache(t *testing.T) {
 	}
 }
 
-func TestDriver_RueidisCache(t *testing.T) {
-	ctx := context.Background()
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockClient := mock.NewClient(ctrl)
-
-	db, sqlMock, err := sqlmock.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	rueidisBackend := rueidiscache.New(mockClient)
-	drv := entcache.NewDriver(
-		sql.OpenDB(dialect.Postgres, db),
-		entcache.TTL(time.Minute),
-		entcache.Levels(rueidisBackend),
-		entcache.Hash(func(string, []interface{}) (entcache.Key, error) {
-			return "query:key:1", nil
-		}),
-	)
-
-	// 1. Miss -> DB Query -> Store in Rueidis
-	getCmd := mockClient.B().Get().Key("query:key:1").Build()
-	mockClient.EXPECT().Do(ctx, getCmd).Return(mock.Result(mock.RedisNil()))
-
-	sqlMock.ExpectQuery("SELECT id FROM users").
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(10)))
-
-	mockClient.EXPECT().Do(ctx, gomock.Any()).Return(mock.Result(mock.RedisString("OK")))
-
-	expectQuery(ctx, t, drv, "SELECT id FROM users", []interface{}{int64(10)})
-
-	if err := sqlMock.ExpectationsWereMet(); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestDriver_StampedeLock(t *testing.T) {
 	db, sqlMock, err := sqlmock.New()
 	if err != nil {
@@ -491,6 +455,110 @@ func TestDriver_StampedeLock(t *testing.T) {
 	}()
 
 	wg.Wait()
+
+	if err := sqlMock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDriver_ReleaseOnScanError(t *testing.T) {
+	db, sqlMock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	drv := entcache.NewDriver(
+		sql.OpenDB(dialect.Postgres, db),
+		entcache.Levels(contextcache.New()),
+		entcache.Hash(func(string, []interface{}) (entcache.Key, error) {
+			return "query:key:1", nil
+		}),
+	)
+
+	// First query (Winner) will fail during scanning!
+	sqlMock.ExpectQuery("SELECT id FROM users").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)).RowError(0, fmt.Errorf("mid-scan panic/error")))
+
+	ctx := context.Background()
+
+	// Execute the query
+	rows := &entSql.Rows{}
+	err = drv.Query(ctx, "SELECT id FROM users", []interface{}{}, rows)
+	if err != nil {
+		t.Fatalf("expected query to succeed and return rows, got err: %v", err)
+	}
+
+	// Read rows (this is where the error happens!)
+	for rows.Next() {
+		// Do nothing
+	}
+	if rows.Err() == nil || rows.Err().Error() != "mid-scan panic/error" {
+		t.Fatalf("expected mid-scan error, got: %v", rows.Err())
+	}
+
+	// The ORM defers rows.Close() which calls recorder.Close().
+	// THIS is what was previously skipping releaseFunc because rows.Err() != nil.
+	_ = rows.Close()
+
+	// Waiter: If the lock leaked, this will block forever.
+	// If the fix in recorder.Close() works, the lock is released, and we can query again!
+	sqlMock.ExpectQuery("SELECT id FROM users").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(2)))
+
+	ctxTimeout, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+
+	rows2 := &entSql.Rows{}
+	err = drv.Query(ctxTimeout, "SELECT id FROM users", []interface{}{}, rows2)
+	if err != nil {
+		t.Fatalf("waiter failed to acquire lock (did it leak?): %v", err)
+	}
+	_ = rows2.Close()
+
+	if err := sqlMock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDriver_RueidisCache(t *testing.T) {
+	s, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	client, err := rueidis.NewClient(rueidis.ClientOption{
+		InitAddress: []string{s.Addr()},
+		DisableCache: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+
+	db, sqlMock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	rueidisBackend := rueidiscache.New(client)
+	drv := entcache.NewDriver(
+		sql.OpenDB(dialect.Postgres, db),
+		entcache.TTL(time.Minute),
+		entcache.Levels(rueidisBackend),
+	)
+
+	// First query: Miss -> DB Query -> Cached in Rueidis
+	sqlMock.ExpectQuery("SELECT id, name FROM users WHERE id = 2").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).AddRow(int64(2), "alice"))
+	expectQuery(ctx, t, drv, "SELECT id, name FROM users WHERE id = 2", []interface{}{int64(2), "alice"})
+
+	// Second query: Hit directly from Rueidis Cache
+	expectQuery(ctx, t, drv, "SELECT id, name FROM users WHERE id = 2", []interface{}{int64(2), "alice"})
 
 	if err := sqlMock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

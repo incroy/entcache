@@ -3,6 +3,7 @@ package natscache_test
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,9 @@ import (
 
 	"github.com/incroy/entcache"
 	"github.com/incroy/entcache/natscache"
+	"entgo.io/ent/dialect"
+	entSql "entgo.io/ent/dialect/sql"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/nats-io/nats-server/v2/server"
 	natsserver "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
@@ -185,8 +189,8 @@ func TestNatsLockOrWait_HeartbeatFailure(t *testing.T) {
 		_, waiterErr = wait2(ctx)
 	}()
 
-	// Simulate crash of c1
-	c1.Close()
+	// Simulate ungraceful crash of c1
+	c1.Crash()
 
 	wg.Wait()
 	require.ErrorIs(t, waiterErr, entcache.ErrRetryLocker, "expected ErrRetryLocker on heartbeat failure")
@@ -619,4 +623,246 @@ func TestNatsLockOrWait_StampedeServerCrash(t *testing.T) {
 		return true
 	})
 	require.False(t, hasErr)
+}
+
+func TestNatsLock_ReleaseCAS(t *testing.T) {
+	ctx := context.Background()
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
+
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:         "entcache_cas_test",
+		LimitMarkerTTL: 1 * time.Second,
+	})
+	require.NoError(t, err)
+
+	c1 := natscache.New(kv)
+	c2 := natscache.New(kv)
+
+	key := "test:nats:cas_release"
+	lockKey := strings.ReplaceAll(key, ":", "_") + "_lock"
+
+	// 1. c1 gets lock
+	won1, _, release1, err := c1.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won1)
+
+	// 2. c1 is "slow", lock expires or is stolen
+	err = kv.Delete(ctx, lockKey)
+	require.NoError(t, err)
+
+	// 3. c2 gets lock (steals it)
+	won2, _, _, err := c2.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won2)
+
+	// 4. c1 releases lock
+	release1(ctx)
+
+	// 5. check if c2's lock is still there
+	_, err = kv.Get(ctx, lockKey)
+	require.NoError(t, err, "c2's lock should not have been deleted by c1's release")
+}
+
+func TestNatsLock_NoSpuriousInvalidationOnLock(t *testing.T) {
+	ctx := context.Background()
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
+
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:         "entcache_inval_test",
+		LimitMarkerTTL: 1 * time.Second,
+	})
+	require.NoError(t, err)
+
+	c := natscache.New(kv)
+	key := "test:nats:inval_lock"
+
+	invalidated := make(chan string, 10)
+	err = c.WatchInvalidations(ctx, func(k entcache.Key) {
+		invalidated <- k.(string)
+	})
+	require.NoError(t, err)
+
+	won, _, release, err := c.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won)
+	release(ctx)
+
+	select {
+	case k := <-invalidated:
+		t.Fatalf("unexpected invalidation for %s", k)
+	case <-time.After(1 * time.Second):
+		// success
+	}
+}
+
+func TestNatsLockOrWait_HeartbeatFailureTiming(t *testing.T) {
+	ctx := context.Background()
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
+
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "entcache_timing_test",
+	})
+	require.NoError(t, err)
+
+	c1 := natscache.New(kv)
+	c2 := natscache.New(kv)
+	key := "test:nats:timing"
+
+	won1, _, _, err := c1.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won1)
+
+	won2, wait2, _, err := c2.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.False(t, won2)
+
+	c1.Crash() // Simulate ungraceful crash
+
+	start := time.Now()
+	_, err = wait2(ctx)
+	require.ErrorIs(t, err, entcache.ErrRetryLocker)
+	require.WithinDuration(t, start, time.Now(), 16*time.Second, "waiter took too long to recover")
+}
+
+func TestNatsLockOrWait_HeartbeatFailureMidWatch(t *testing.T) {
+	ctx := context.Background()
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
+
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "entcache_timing_midwatch_test",
+	})
+	require.NoError(t, err)
+
+	c1 := natscache.New(kv)
+	c2 := natscache.New(kv)
+	key := "test:nats:timing_midwatch"
+
+	won1, _, _, err := c1.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won1)
+
+	won2, wait2, _, err := c2.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.False(t, won2)
+
+	var wg sync.WaitGroup
+	var waiterErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, waiterErr = wait2(ctx)
+	}()
+
+	// sleep a bit so wait2 enters the watch loop
+	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
+	c1.Crash() // Simulate ungraceful crash MID-WATCH
+
+	wg.Wait()
+	require.ErrorIs(t, waiterErr, entcache.ErrRetryLocker)
+	require.WithinDuration(t, start, time.Now(), 16*time.Second, "waiter took too long to recover from mid-watch crash")
+}
+
+func TestNatsLockOrWait_HeartbeatFailureUngraceful(t *testing.T) {
+	ctx := context.Background()
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
+
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "entcache_timing_ungraceful_test",
+	})
+	require.NoError(t, err)
+
+	c1 := natscache.New(kv)
+	c2 := natscache.New(kv)
+	key := "test:nats:timing_ungraceful"
+
+	won1, _, _, err := c1.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.True(t, won1)
+
+	won2, wait2, _, err := c2.LockOrWait(ctx, key)
+	require.NoError(t, err)
+	require.False(t, won2)
+
+	var wg sync.WaitGroup
+	var waiterErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, waiterErr = wait2(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
+	// UNGRACEFUL CRASH: Stop the heartbeat without deleting the marker
+	c1.Crash()
+
+	wg.Wait()
+	require.ErrorIs(t, waiterErr, entcache.ErrRetryLocker)
+	require.WithinDuration(t, start, time.Now(), 16*time.Second, "waiter took too long to recover from ungraceful crash")
+}
+
+func TestNatsDriver_StampedeLoaderErrorRetry(t *testing.T) {
+	s := runNatsServer(t)
+	_, js := makeNatsClient(t, s)
+
+	ctx := context.Background()
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:         "entcache_driver_loader_err",
+		TTL:            10 * time.Minute,
+		LimitMarkerTTL: 1 * time.Second,
+	})
+	require.NoError(t, err)
+
+	db, sqlMock, err := sqlmock.New()
+	require.NoError(t, err)
+
+	queryErr := errors.New("simulated db error")
+	
+	// 1st query returns an error
+	sqlMock.ExpectQuery("SELECT name FROM users").WillReturnError(queryErr)
+	// 2nd query (the retry from the waiter) succeeds
+	sqlMock.ExpectQuery("SELECT name FROM users").WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("bob"))
+
+	drv := entcache.NewDriver(
+		entSql.OpenDB(dialect.Postgres, db),
+		entcache.Levels(natscache.New(kv)), // Verified explicitly against NatsKV
+		entcache.TTL(time.Minute),
+	)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// First caller (Winner)
+	go func() {
+		defer wg.Done()
+		rows := &entSql.Rows{}
+		err := drv.Query(ctx, "SELECT name FROM users", []interface{}{"bob"}, rows)
+		if err == nil {
+			t.Errorf("expected error from first query, got nil")
+		}
+	}()
+
+	// Second caller (Waiter)
+	go func() {
+		defer wg.Done()
+		time.Sleep(50 * time.Millisecond) // Ensure it runs after the first starts
+		
+		rows := &entSql.Rows{}
+		err := drv.Query(ctx, "SELECT name FROM users", []interface{}{"bob"}, rows)
+		require.NoError(t, err)
+	}()
+
+	wg.Wait()
+
+	if err := sqlMock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
 }

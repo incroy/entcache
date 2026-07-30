@@ -138,7 +138,7 @@ func (l *LRU) LockOrWait(ctx context.Context, k entcache.Key) (bool, func(contex
 
 	release := func(_ context.Context) {
 		l.mu.Lock()
-		if ch, ok := l.waits[key]; ok {
+		if existing, ok := l.waits[key]; ok && existing == ch {
 			close(ch)
 			delete(l.waits, key)
 		}

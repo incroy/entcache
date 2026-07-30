@@ -17,7 +17,6 @@ import (
 // with built-in distributed stampede locking and real-time Watch invalidations.
 type NatsKV struct {
 	kv     jetstream.KeyValue
-	locks  sync.Map // map[string]uint64
 	mu     sync.Mutex
 	id     string
 	ctx    context.Context
@@ -58,11 +57,11 @@ func (n *NatsKV) keepalive() string {
 
 	if id == "" {
 		id = "natsid_" + uuid.NewString()
-		if _, err := n.kv.Create(n.ctx, id, []byte("1"), jetstream.KeyTTL(10*time.Second)); err == nil {
+		if rev, err := n.kv.Create(n.ctx, id, []byte("1"), jetstream.KeyTTL(10*time.Second)); err == nil {
 			n.mu.Lock()
 			if n.id == "" {
 				n.id = id
-				go n.refresh(id)
+				go n.refresh(id, rev)
 			} else {
 				id = n.id
 			}
@@ -72,18 +71,9 @@ func (n *NatsKV) keepalive() string {
 	return id
 }
 
-func (n *NatsKV) refresh(id string) {
+func (n *NatsKV) refresh(id string, rev uint64) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-
-	// Initial create sets the 10s TTL.
-	// If it somehow already exists, we ignore the error (we'll just fall back to Put/Create later if needed)
-	rev, err := n.kv.Create(n.ctx, id, []byte("1"), jetstream.KeyTTL(10*time.Second))
-	if err != nil && errors.Is(err, jetstream.ErrKeyExists) {
-		if entry, getErr := n.kv.Get(n.ctx, id); getErr == nil {
-			rev = entry.Revision()
-		}
-	}
 
 	for {
 		select {
@@ -128,11 +118,6 @@ func (n *NatsKV) Add(ctx context.Context, k entcache.Key, e *entcache.Entry, ttl
 		_, err = n.kv.Put(ctx, key, buf)
 	}
 
-	// If we hold the stampede lock, clear it to wake up waiters.
-	// This must happen AFTER data is written so they find it.
-	if rev, ok := n.locks.LoadAndDelete(key); ok {
-		_ = n.kv.Purge(ctx, key+"_lock", jetstream.LastRevision(rev.(uint64)))
-	}
 	return err
 }
 
@@ -195,13 +180,12 @@ func (n *NatsKV) LockOrWait(ctx context.Context, k entcache.Key) (bool, func(con
 
 	placeholderID := n.keepalive()
 
-	rev, err := n.kv.Create(ctx, lockKey, []byte(placeholderID), jetstream.KeyTTL(30*time.Second))
+	// Create lock key without a TTL. We rely exclusively on checking the liveness
+	// of placeholderID in the wait() loop. A dead holder's lock will be purged by the next waiter.
+	rev, err := n.kv.Create(ctx, lockKey, []byte(placeholderID))
 	if err == nil {
-		n.locks.Store(key, rev)
 		release := func(c context.Context) {
-			if storedRev, ok := n.locks.LoadAndDelete(key); ok {
-				_ = n.kv.Purge(c, lockKey, jetstream.LastRevision(storedRev.(uint64)))
-			}
+			_ = n.kv.Purge(c, lockKey, jetstream.LastRevision(rev))
 		}
 		return true, nil, release, nil
 	}
@@ -244,18 +228,19 @@ func (n *NatsKV) LockOrWait(ctx context.Context, k entcache.Key) (bool, func(con
 		}
 		defer watcher.Stop()
 
-		timer := time.NewTimer(5 * time.Second)
-		defer timer.Stop()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
 
 		for {
 			select {
 			case <-c.Done():
 				return nil, c.Err()
-			case <-timer.C:
+			case <-ticker.C:
 				if _, ckErr := n.kv.Get(c, holderID); ckErr != nil && errors.Is(ckErr, jetstream.ErrKeyNotFound) {
 					_ = n.kv.Purge(c, lockKey, jetstream.LastRevision(holderRev))
+					return nil, entcache.ErrRetryLocker
 				}
-				return nil, entcache.ErrRetryLocker
+				// Holder is still alive, keep watching!
 			case update, ok := <-watcher.Updates():
 				if !ok {
 					return nil, entcache.ErrRetryLocker
@@ -309,8 +294,10 @@ func (n *NatsKV) WatchInvalidations(ctx context.Context, onInvalidate func(key e
 					if strings.HasPrefix(k, "natsid_") {
 						continue
 					}
-					if op == jetstream.KeyValueDelete {
-						onInvalidate(k)
+					if op == jetstream.KeyValueDelete || op == jetstream.KeyValuePut {
+						if !strings.HasSuffix(k, "_lock") {
+							onInvalidate(k)
+						}
 					}
 				}
 			}
@@ -322,4 +309,9 @@ func (n *NatsKV) WatchInvalidations(ctx context.Context, onInvalidate func(key e
 func sanitizeKey(k entcache.Key) string {
 	s := fmt.Sprint(k)
 	return strings.ReplaceAll(s, ":", "_")
+}
+
+// crash simulates an ungraceful shutdown by stopping the heartbeat without deleting the marker.
+func (n *NatsKV) crash() {
+	n.cancel()
 }

@@ -235,10 +235,8 @@ func (d *Driver) queryWithStampedeLock(ctx context.Context, query string, args a
 	vr.ColumnScanner = &recorder{
 		ColumnScanner: vr.ColumnScanner,
 		skipNotFound:  opts.skipNotFound,
+		releaseFunc:   releaseFunc,
 		onClose: func(columns []string, values [][]driver.Value) {
-			if releaseFunc != nil {
-				defer releaseFunc(context.Background())
-			}
 			err := d.Cache.Add(ctx, opts.key, &Entry{Columns: columns, Values: values}, opts.ttl)
 			if err != nil && d.Log != nil {
 				atomic.AddUint64(&d.stats.Errors, 1)
@@ -359,6 +357,7 @@ type recorder struct {
 	done         bool
 	skipNotFound bool
 	onClose      func([]string, [][]driver.Value)
+	releaseFunc  func(context.Context)
 }
 
 func (r *recorder) Next() bool {
@@ -396,6 +395,11 @@ func (r *recorder) Columns() ([]string, error) {
 }
 
 func (r *recorder) Close() error {
+	if r.releaseFunc != nil {
+		release := r.releaseFunc
+		r.releaseFunc = nil
+		defer release(context.Background())
+	}
 	if err := r.ColumnScanner.Close(); err != nil {
 		return err
 	}

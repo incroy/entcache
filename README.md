@@ -94,9 +94,14 @@ Embedded directly in `ent.Client` via `entcache.NewDriver`. The driver-level cac
 
 ![driver-level-cache](https://github.com/ariga/entcache/raw/assets/internal/assets/drvlevel.png)
 
+#### Hashicorp LRU (`lrucache`)
+
+Thread-safe in-process LRU cache powered by `github.com/hashicorp/golang-lru/v2`. Fast, zero-network-overhead.
+
 ```go
-drv := entcache.NewDriver(
-    sqlDrv,
+import "github.com/incroy/entcache/lrucache"
+
+drv := entcache.NewDriver(sqlDrv,
     entcache.TTL(time.Minute),
     entcache.Levels(lrucache.MustNew(1000)),
 )
@@ -110,7 +115,8 @@ A cache hierarchy structures cache stores by access speed and capacity (e.g. L1 
 Entcache supports a variety of backend adapters. Below are the supported cache architectures and their features:
 
 #### Rueidis (`rueidiscache`)
-[Rueidis](https://github.com/redis/rueidis) is a high-performance Redis client. 
+High-performance Redis cache powered by [Rueidis](https://github.com/redis/rueidis) (`github.com/incroy/entcache/rueidiscache`).
+
 **Note:** You **do not** need to pair `rueidiscache` with `lrucache`. Rueidis natively supports **RESP3 Client-Side Caching**, meaning it automatically maintains an in-memory cache on the client-side and receives server-assisted invalidation pushes transparently!
 
 **Features:**
@@ -119,18 +125,28 @@ Entcache supports a variety of backend adapters. Below are the supported cache a
 - Automatic Server-Crash recovery mechanisms.
 
 ```go
+import (
+    "github.com/redis/rueidis"
+    "github.com/incroy/entcache/rueidiscache"
+)
+
+c, _ := rueidis.NewClient(rueidis.ClientOption{
+    InitAddress: []string{"127.0.0.1:6379"},
+})
+
+// Native Client-Side Caching is active out of the box!
 // Lookups: Rueidis In-Memory Map -> Redis Server -> Database
 drv := entcache.NewDriver(
     sqlDrv,
     entcache.TTL(time.Minute),
     entcache.Levels(
-        rueidiscache.New(rueidisClient), // Acts as both L1 & L2 seamlessly
+        rueidiscache.New(c), // Acts as both L1 & L2 seamlessly
     ),
 )
 ```
 
 #### Redis (`rediscache` / `go-redis`)
-Standard remote cache backed by the popular [go-redis](https://github.com/redis/go-redis) client. 
+Standard remote cache backed by the popular [go-redis](https://github.com/redis/go-redis/v9) client (`github.com/incroy/entcache/rediscache`).
 
 **Features:**
 - Traditional L1/L2 multi-level cache architecture.
@@ -138,6 +154,14 @@ Standard remote cache backed by the popular [go-redis](https://github.com/redis/
 - **Keyspace Events:** Use `rediscache.WithKeyspaceEvents()` to eliminate polling and gracefully handle lock expirations during server crashes via Pub/Sub.
 
 ```go
+import (
+    "github.com/redis/go-redis/v9"
+    "github.com/incroy/entcache/rediscache"
+    "github.com/incroy/entcache/lrucache"
+)
+
+rdb := redis.NewClient(&redis.Options{Addr: ":6379"})
+
 // Lookups: L1 (LRU) -> L2 (go-redis) -> Database
 drv := entcache.NewDriver(
     sqlDrv,
@@ -145,7 +169,7 @@ drv := entcache.NewDriver(
     entcache.Levels(
         lrucache.MustNew(256), // Level 1: fast in-process memory
         rediscache.New(
-            goRedisClient,
+            rdb,
             rediscache.WithKeyspaceEvents(), // Recommended for optimal stampede protection
         ),                     // Level 2: Redis
     ),
@@ -153,14 +177,31 @@ drv := entcache.NewDriver(
 ```
 
 #### NATS JetStream KV (`natscache`)
-Distributed cache backed by durable NATS JetStream KeyValue buckets.
+Distributed cache backed by durable NATS JetStream KeyValue buckets (`github.com/incroy/entcache/natscache`).
 
 **Features:**
 - Masterless distributed architecture.
-- Distributed Stampede Protection via native NATS `Watch` events (`KeyValueDelete`).
-- Fault-tolerant background heartbeats for lock ownership tracking.
+- Distributed Stampede Protection via native NATS `Watch` events (`KeyValueDelete` / `KeyValuePurge`).
+- Fault-tolerant background heartbeats for lock ownership tracking (prevents deadlocks).
 
 ```go
+import (
+    "github.com/nats-io/nats.go"
+    "github.com/nats-io/nats.go/jetstream"
+    "github.com/incroy/entcache/natscache"
+    "github.com/incroy/entcache/lrucache"
+)
+
+nc, _ := nats.Connect(nats.DefaultURL)
+js, _ := jetstream.New(nc)
+
+// Important: LimitMarkerTTL MUST be enabled for the lock's per-key TTL to work.
+kv, _ := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+    Bucket:         "entcache",
+    TTL:            10 * time.Minute,
+    LimitMarkerTTL: time.Second, // Required for stampede protection heartbeats
+})
+
 // Lookups: L1 (LRU) -> L2 (NATS) -> Database
 drv := entcache.NewDriver(
     sqlDrv,
@@ -174,98 +215,6 @@ drv := entcache.NewDriver(
 
 ---
 
-## Modular Cache Backends
-
-### NATS JetStream KV (`natscache`)
-
-Distributed cache backed by NATS JetStream KeyValue (`github.com/incroy/entcache/natscache`).
-
-**Out-of-the-Box Features**:
-- **Distributed Caching**: Stores cache data directly inside NATS JetStream KV, providing a durable, scalable, clustered backend.
-- **Distributed Cache Stampede Protection**: Waiters block via native `Watch` events (`KeyValueDelete` / `KeyValuePurge`) allowing real-time cross-node invalidation and resumption.
-- **Fault-Tolerant Heartbeats**: Background keepalives prevent deadlocks and ensure accurate TTLs using a 2-key architecture.
-
-```go
-import (
-    "github.com/nats-io/nats.go/jetstream"
-    "github.com/incroy/entcache/natscache"
-)
-
-nc, _ := nats.Connect(nats.DefaultURL)
-js, _ := jetstream.New(nc)
-
-// Important: LimitMarkerTTL MUST be enabled for the lock's per-key TTL to work.
-kv, _ := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-    Bucket:         "entcache",
-    TTL:            10 * time.Minute,
-    LimitMarkerTTL: time.Second, // Required for stampede protection heartbeats
-})
-
-drv := entcache.NewDriver(sqlDrv,
-    entcache.TTL(time.Minute),
-    entcache.Levels(natscache.New(kv)),
-)
-```
-
-### Rueidis (`rueidiscache`)
-
-High-performance Redis cache powered by Rueidis (`github.com/incroy/entcache/rueidiscache`).
-
-**Out-of-the-Box Features**:
-- **Native RESP3 Client-Side Caching**: Natively activated out of the box! Rueidis caches keys in-memory on the client and receives server-driven invalidation tracking messages from Redis. No extra L1 LRU layer is required.
-- **Stampede Protection**: Built-in channel wait locks prevent multiple concurrent database queries for the same key.
-
-```go
-import (
-    "github.com/redis/rueidis"
-    "github.com/incroy/entcache/rueidiscache"
-)
-
-c, err := rueidis.NewClient(rueidis.ClientOption{
-    InitAddress: []string{"127.0.0.1:6379"},
-})
-if err != nil {
-    log.Fatal(err)
-}
-
-// Native Client-Side Caching is active out of the box!
-drv := entcache.NewDriver(sqlDrv,
-    entcache.TTL(time.Minute),
-    entcache.Levels(rueidiscache.New(c)),
-)
-```
-
-### Redis (`rediscache`)
-
-Standard remote cache backed by `github.com/redis/go-redis/v9` (`github.com/incroy/entcache/rediscache`).
-
-```go
-import (
-    "github.com/redis/go-redis/v9"
-    "github.com/incroy/entcache/rediscache"
-)
-
-rdb := redis.NewClient(&redis.Options{Addr: ":6379"})
-drv := entcache.NewDriver(sqlDrv,
-    entcache.TTL(time.Minute),
-    entcache.Levels(rediscache.New(rdb)),
-)
-```
-
-### Hashicorp LRU (`lrucache`)
-
-Thread-safe in-process LRU cache powered by `github.com/hashicorp/golang-lru/v2`. Fast, zero-network-overhead.
-
-```go
-import "github.com/incroy/entcache/lrucache"
-
-drv := entcache.NewDriver(sqlDrv,
-    entcache.TTL(time.Minute),
-    entcache.Levels(lrucache.MustNew(1000)),
-)
-```
-
----
 
 ## Mutation-Aware Invalidation
 
